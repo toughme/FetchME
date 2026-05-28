@@ -9,13 +9,12 @@ import queue
 import secrets
 import subprocess
 import sys
-import threading
 import tkinter as tk
 import urllib.parse
 import webbrowser
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -41,12 +40,10 @@ class OAuthSessionState:
 class PKCEHelper:
     @staticmethod
     def generate_code_verifier(length: int = 128) -> str:
-        """Generate PKCE code verifier."""
         return base64.urlsafe_b64encode(secrets.token_bytes(length // 2)).decode('utf-8').rstrip('=')
 
     @staticmethod
     def generate_code_challenge(code_verifier: str) -> str:
-        """Generate PKCE code challenge from verifier."""
         code_sha = hashlib.sha256(code_verifier.encode('utf-8')).digest()
         return base64.urlsafe_b64encode(code_sha).decode('utf-8').rstrip('=')
 
@@ -57,7 +54,6 @@ class ProtocolHandler:
 
     @staticmethod
     def register_protocol_handler(app_exe_path: str | None = None) -> bool:
-        """Register Windows protocol handler for custom URI scheme."""
         try:
             import winreg
         except ImportError:
@@ -89,7 +85,6 @@ class ProtocolHandler:
 
     @staticmethod
     def parse_callback_uri(uri: str) -> dict[str, str]:
-        """Parse OAuth callback URI."""
         parsed = urllib.parse.urlparse(uri)
         params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         return params
@@ -109,77 +104,41 @@ class TextRedirector(io.TextIOBase):
         pass
 
 
-class StatusAwareTextRedirector(io.TextIOBase):
-    def __init__(self, write_callback, status_callback=None):
-        self.write_callback = write_callback
-        self.status_callback = status_callback
-        self.buffer = ''
+STATUS_PENDING = 'Pending'
+STATUS_DETECTING = 'Detecting servers...'
+STATUS_TRYING_IMAP = 'Trying IMAP login...'
+STATUS_TRYING_POP3 = 'Trying POP3 login...'
+STATUS_IMAP_FAILED = 'IMAP login failed'
+STATUS_POP3_FAILED = 'POP3 login failed'
+STATUS_LOGIN_FAILED = 'Login failed'
+STATUS_LOGGED_IN = 'Logged in'
+STATUS_OAUTH_PENDING = 'OAuth pending...'
+STATUS_FETCHING = 'Fetching...'
+STATUS_COMPLETED = 'Completed'
+STATUS_ERROR = 'Error'
+STATUS_STOPPED = 'Stopped'
 
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        self.buffer += s
-        
-        # Try to extract status information from the message
-        if self.status_callback:
-            self._parse_and_report_status(s)
-        
-        self.write_callback(s)
-        return len(s)
 
-    def _parse_and_report_status(self, message: str) -> None:
-        """Parse log messages and extract status updates."""
-        msg = message.lower()
-        
-        # Extract email if present
-        email = ''
-        if '@' in message:
-            import re
-            match = re.search(r'[\w\.-]+@[\w\.-]+', message)
-            if match:
-                email = match.group(0)
-        
-        # Connection status detection
-        if 'connecting' in msg and 'imap' in msg:
-            self.status_callback(email, 'Logging in with IMAP...', '')
-        elif 'connecting' in msg and 'pop3' in msg:
-            self.status_callback(email, 'Logging in with POP3...', '')
-        elif 'pop3 login succeeded' in msg or 'imap login succeeded' in msg or 'xoauth2 authentication succeeded' in msg:
-            self.status_callback(email, 'Logged in', '')
-        elif 'authentication failed' in msg or 'login failed' in msg:
-            self.status_callback(email, 'Logging failed', '')
-        
-        # Fetch progress detection
-        elif 'found' in msg and 'folders' in msg:
-            import re
-            match = re.search(r'found\s+(\d+)\s+folders', msg)
-            if match:
-                self.status_callback(email, '', f"Searching {match.group(1)} folders...")
-        elif 'fetching folder' in msg:
-            import re
-            match = re.search(r'fetching folder\s+(\S+)', msg)
-            if match:
-                folder_name = match.group(1)
-                self.status_callback(email, '', f"Searching {folder_name} folder...")
-        elif 'messages matching criteria' in msg:
-            import re
-            match = re.search(r'(\d+)\s+messages matching criteria', msg)
-            if match:
-                count = match.group(1)
-                self.status_callback(email, '', f"Found {count} emails - starting fetch...")
-        elif 'completed' in msg.lower() and 'save' not in msg.lower():
-            self.status_callback(email, '', 'Completed')
-
-    def flush(self) -> None:
-        pass
+@dataclass
+class LoginEntry:
+    email: str
+    password: str
+    domain: str
+    status: str = STATUS_PENDING
+    protocol: str = ''
+    server: str = ''
+    progress: str = ''
+    oauth_session: OAuthSessionState | None = None
+    fetcher: core.BaseFetcher | None = None
+    fetching: bool = False
 
 
 class MailListFetcherGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title('Mail List Fetcher v2.5')
-        self.geometry('1024x760')
-        self.minsize(980, 720)
+        self.geometry('1280x860')
+        self.minsize(1100, 780)
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self._configure_style()
 
@@ -192,7 +151,6 @@ class MailListFetcherGUI(tk.Tk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.main_thread_id = threading.get_ident()
         self.status_updates_queue: queue.Queue[dict] = queue.Queue()
-        self.status_tree_items: dict[str, str] = {}
 
         self.provider_var = tk.StringVar(value='IMAP')
         self.email_var = tk.StringVar()
@@ -202,15 +160,15 @@ class MailListFetcherGUI(tk.Tk):
         self.ssl_var = tk.BooleanVar(value=True)
         self.output_var = tk.StringVar(value=str(self.script_dir / 'output'))
         self.login_file = self.script_dir / 'logins.txt'
-        self.login_listbox: tk.Listbox | None = None
-        self.login_context_menu: tk.Menu | None = None
-        self.login_entries: list[tuple[str, str, str]] = []
+        self.login_entries: list[LoginEntry] = []
         self.oauth_client_id = 'e9a7fea1-1cc0-4cd9-a31b-9137ca5deedd'
         self.oauth_authority = 'https://login.microsoftonline.com/common'
         self.oauth_session: OAuthSessionState | None = None
         self._oauth_in_progress = False
         self._oauth_helper_proc: subprocess.Popen | None = None
         self._oauth_result_file: Path | None = None
+        self._auto_login_for_entry: LoginEntry | None = None
+        self._server_options: list[tuple[str, str, str | None, int | None, str | None]] = []
 
         self.keyword_var = tk.StringVar()
         self.date_from_var = tk.StringVar()
@@ -231,7 +189,8 @@ class MailListFetcherGUI(tk.Tk):
         self.attachment_whitelist_text: tk.Text | None = None
         self.attachment_blacklist_text: tk.Text | None = None
         self.log_text: tk.Text | None = None
-        self.status_tree: ttk.Treeview | None = None
+        self.login_tree: ttk.Treeview | None = None
+        self.server_combo: ttk.Combobox | None = None
 
         self._build_gui()
         try:
@@ -257,10 +216,11 @@ class MailListFetcherGUI(tk.Tk):
         style.configure('TButton', padding=(10, 5))
         style.configure('TNotebook', background='#f5f7fb')
         style.configure('TNotebook.Tab', padding=(12, 6))
+        style.configure('Status.Treeview', rowheight=24)
+        style.configure('Status.Treeview.Heading', font=('Segoe UI', 9, 'bold'))
         self.configure(background='#f5f7fb')
 
     def _register_oauth_protocol_handler(self) -> None:
-        """Register Windows protocol handler for OAuth callback."""
         try:
             script_path = Path(__file__).resolve()
             success = ProtocolHandler.register_protocol_handler(str(script_path))
@@ -269,50 +229,38 @@ class MailListFetcherGUI(tk.Tk):
             else:
                 self.append_log('Note: OAuth protocol handler registration requires admin privileges.\n')
         except Exception as e:
-            print(f'Protocol handler registration error: {e}')  # Use print to avoid log_text issues
             self.append_log(f'Protocol handler registration skipped: {e}\n')
 
     def _get_secure_token_dir(self) -> Path:
-        """Get secure token storage directory."""
         token_dir = self.script_dir / '.oauth_tokens'
         token_dir.mkdir(exist_ok=True, mode=0o700)
         return token_dir
 
     def save_oauth_token(self, provider: str, email: str, token_data: dict) -> bool:
-        """Save OAuth token securely."""
         try:
             token_dir = self._get_secure_token_dir()
             token_file = token_dir / f'{provider}_{email}.json'
-            
-            # Include metadata
             token_data['provider'] = provider
             token_data['email'] = email
             token_data['saved_at'] = time.time()
-            
             with token_file.open('w', encoding='utf-8') as fp:
                 json.dump(token_data, fp)
-            
-            # Restrict file permissions
             try:
                 import stat
                 token_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
             except Exception:
                 pass
-            
             return True
         except Exception as e:
             self.append_log(f'Failed to save OAuth token: {e}\n')
             return False
 
     def load_oauth_token(self, provider: str, email: str) -> dict | None:
-        """Load OAuth token securely."""
         try:
             token_dir = self._get_secure_token_dir()
             token_file = token_dir / f'{provider}_{email}.json'
-            
             if not token_file.exists():
                 return None
-            
             with token_file.open('r', encoding='utf-8') as fp:
                 return json.load(fp)
         except Exception as e:
@@ -324,10 +272,10 @@ class MailListFetcherGUI(tk.Tk):
         container.pack(fill='both', expand=True, padx=10, pady=10)
 
         connection_frame = ttk.LabelFrame(container, text='Connection & Account')
-        connection_frame.pack(fill='x', pady=(0, 10))
+        connection_frame.pack(fill='x', pady=(0, 6))
 
         provider_frame = ttk.Frame(connection_frame)
-        provider_frame.grid(row=0, column=0, columnspan=4, sticky='w', pady=(4, 8))
+        provider_frame.grid(row=0, column=0, columnspan=6, sticky='w', pady=(4, 8))
         ttk.Label(provider_frame, text='Provider:').pack(side='left', padx=(0, 8))
         for provider in ['IMAP', 'POP3', 'Exchange']:
             ttk.Radiobutton(provider_frame, text=provider, variable=self.provider_var, value=provider, command=self._update_port_label).pack(side='left', padx=6)
@@ -338,16 +286,21 @@ class MailListFetcherGUI(tk.Tk):
         ttk.Entry(connection_frame, textvariable=self.password_var, show='*', width=32).grid(row=1, column=3, sticky='w', padx=4, pady=2)
 
         ttk.Label(connection_frame, text='Server:').grid(row=2, column=0, sticky='w', padx=4, pady=2)
-        ttk.Entry(connection_frame, textvariable=self.server_var, width=32).grid(row=2, column=1, sticky='w', padx=4, pady=2)
-        ttk.Label(connection_frame, text='Port:').grid(row=2, column=2, sticky='w', padx=4, pady=2)
-        ttk.Entry(connection_frame, textvariable=self.port_var, width=10).grid(row=2, column=3, sticky='w', padx=4, pady=2)
+        server_frame = ttk.Frame(connection_frame)
+        server_frame.grid(row=2, column=1, columnspan=3, sticky='w', padx=4, pady=2)
+        self.server_combo = ttk.Combobox(server_frame, textvariable=self.server_var, width=38, state='normal')
+        self.server_combo.pack(side='left', fill='x', expand=True)
+        self.server_combo.bind('<<ComboboxSelected>>', self._on_server_selected)
+
+        ttk.Label(connection_frame, text='Port:').grid(row=2, column=4, sticky='w', padx=4, pady=2)
+        ttk.Entry(connection_frame, textvariable=self.port_var, width=8).grid(row=2, column=5, sticky='w', padx=4, pady=2)
 
         ttk.Checkbutton(connection_frame, text='Use SSL/TLS', variable=self.ssl_var).grid(row=3, column=0, sticky='w', padx=4, pady=2)
         ttk.Button(connection_frame, text='Auto Detect Server', command=self.auto_detect_server).grid(row=3, column=1, sticky='w', padx=4, pady=2)
-        ttk.Button(connection_frame, text='Open Config Folder', command=self.open_config_folder).grid(row=3, column=2, sticky='w', padx=4, pady=2)
+        ttk.Button(connection_frame, text='Detect All Servers', command=self._detect_all_servers).grid(row=3, column=2, sticky='w', padx=4, pady=2)
 
         oauth_frame = ttk.Frame(connection_frame)
-        oauth_frame.grid(row=4, column=0, columnspan=4, sticky='w', pady=(4, 2))
+        oauth_frame.grid(row=4, column=0, columnspan=6, sticky='w', pady=(4, 2))
         ttk.Label(oauth_frame, text='OAuth:').pack(side='left', padx=(0, 4))
         ttk.Button(oauth_frame, text='OAuth IMAP (Microsoft)', command=self.office_oauth_imap).pack(side='left', padx=4)
         ttk.Button(oauth_frame, text='OAuth Exchange (Microsoft)', command=self.office_oauth_exchange).pack(side='left', padx=4)
@@ -355,53 +308,31 @@ class MailListFetcherGUI(tk.Tk):
         self.oauth_status_label.pack(side='left', padx=(12, 0))
 
         action_frame = ttk.Frame(container)
-        action_frame.pack(fill='x', pady=(0, 10))
+        action_frame.pack(fill='x', pady=(0, 6))
         self.start_button = ttk.Button(action_frame, text='Start Fetch', command=self.start_fetch)
         self.start_button.pack(side='left', padx=(0, 6))
         self.stop_button = ttk.Button(action_frame, text='Stop', command=self.stop_fetch, state='disabled')
         self.stop_button.pack(side='left', padx=(0, 6))
+        ttk.Button(action_frame, text='Login All', command=self._login_all_entries).pack(side='left', padx=(0, 6))
+        ttk.Button(action_frame, text='Fetch All Logged In', command=self._fetch_all_logged_in).pack(side='left', padx=(0, 6))
         ttk.Button(action_frame, text='Save Current Settings', command=self.save_current_settings).pack(side='left', padx=(0, 6))
         ttk.Button(action_frame, text='Reload Config Files', command=self.load_configuration).pack(side='left', padx=(0, 6))
 
         notebook = ttk.Notebook(container)
-        notebook.pack(fill='both', expand=True, pady=(0, 10))
+        notebook.pack(fill='both', expand=True, pady=(0, 6))
 
         self._build_login_tab(notebook)
         self._build_search_tab(notebook)
         self._build_filters_tab(notebook)
         self._build_options_tab(notebook)
 
-        # Status table with fixed height
-        log_frame = ttk.LabelFrame(container, text='Status & Fetch Progress')
-        log_frame.pack(fill='x', pady=(0, 10))
-        
-        tree_frame = ttk.Frame(log_frame)
-        tree_frame.pack(fill='x', padx=4, pady=4)
-        
-        self.status_tree = ttk.Treeview(
-            tree_frame,
-            columns=('Email', 'Connection Status', 'Fetch Progress'),
-            height=5,
-            show='headings'
-        )
-        self.status_tree.column('Email', width=150, anchor='w')
-        self.status_tree.column('Connection Status', width=200, anchor='w')
-        self.status_tree.column('Fetch Progress', width=200, anchor='w')
-        
-        self.status_tree.heading('Email', text='Email Address')
-        self.status_tree.heading('Connection Status', text='Connection Status')
-        self.status_tree.heading('Fetch Progress', text='Fetch Progress')
-        
-        scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.status_tree.yview)
-        self.status_tree.configure(yscroll=scrollbar.set)
-        self.status_tree.pack(side='left', fill='x', expand=True)
-        scrollbar.pack(side='right', fill='y')
-        
-        # Detailed logs
         log_detail_frame = ttk.LabelFrame(container, text='Detailed Logs')
-        log_detail_frame.pack(fill='both', expand=True, pady=(0, 10))
-        self.log_text = tk.Text(log_detail_frame, wrap='word', state='disabled', height=8)
-        self.log_text.pack(fill='both', expand=True, padx=4, pady=4)
+        log_detail_frame.pack(fill='both', expand=True, pady=(0, 6))
+        self.log_text = tk.Text(log_detail_frame, wrap='word', state='disabled', height=6)
+        log_scroll = ttk.Scrollbar(log_detail_frame, orient='vertical', command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        self.log_text.pack(side='left', fill='both', expand=True, padx=(4, 0), pady=4)
+        log_scroll.pack(side='right', fill='y', pady=4)
 
         status_frame = ttk.Frame(container)
         status_frame.pack(fill='x', pady=(0, 0))
@@ -410,39 +341,59 @@ class MailListFetcherGUI(tk.Tk):
 
     def _build_login_tab(self, notebook: ttk.Notebook) -> None:
         login_tab = ttk.Frame(notebook)
-        notebook.add(login_tab, text='Login List')
+        notebook.add(login_tab, text='Login & Status Log')
 
-        login_frame = ttk.Frame(login_tab)
-        login_frame.pack(fill='both', expand=True, padx=8, pady=8)
+        top_frame = ttk.Frame(login_tab)
+        top_frame.pack(fill='x', padx=4, pady=(4, 2))
 
-        left_frame = ttk.Frame(login_frame)
-        left_frame.pack(side='left', fill='both', expand=True, padx=(0, 8))
-        right_frame = ttk.Frame(login_frame)
-        right_frame.pack(side='right', fill='y')
+        btn_frame = ttk.Frame(top_frame)
+        btn_frame.pack(side='left', fill='y')
+        ttk.Button(btn_frame, text='Load Logins...', command=self.choose_login_file).pack(fill='x', padx=2, pady=1)
+        ttk.Button(btn_frame, text='Add Current Login', command=self.add_current_login).pack(fill='x', padx=2, pady=1)
+        ttk.Button(btn_frame, text='Save Login File', command=self.save_login_file).pack(fill='x', padx=2, pady=1)
+        ttk.Button(btn_frame, text='Clear List', command=self.clear_login_list).pack(fill='x', padx=2, pady=1)
+        ttk.Button(btn_frame, text='Remove Selected', command=self._remove_selected_login).pack(fill='x', padx=2, pady=1)
 
-        ttk.Label(left_frame, text='Login Entries (.txt) - format: email|password|domain(optional)').pack(anchor='w')
-        self.login_listbox = tk.Listbox(left_frame, activestyle='dotbox', height=18)
-        self.login_listbox.pack(fill='both', expand=True, pady=4)
-        self.login_listbox.bind('<Double-Button-1>', self.on_login_double_click)
-        self.login_listbox.bind('<Button-3>', self.on_login_right_click)
+        info_label = ttk.Label(top_frame, text='Format: email|password|domain(optional)  |  Double-click: auto-login  |  Right-click: OAuth options', foreground='#6b7280')
+        info_label.pack(side='left', padx=12)
 
-        button_frame = ttk.Frame(right_frame)
-        button_frame.pack(fill='x', pady=4)
-        ttk.Button(button_frame, text='Load Logins...', command=self.choose_login_file).pack(fill='x', padx=4, pady=2)
-        ttk.Button(button_frame, text='Clear List', command=self.clear_login_list).pack(fill='x', padx=4, pady=2)
-        ttk.Button(button_frame, text='Add Current Login', command=self.add_current_login).pack(fill='x', padx=4, pady=2)
-        ttk.Button(button_frame, text='Save Login File', command=self.save_login_file).pack(fill='x', padx=4, pady=2)
+        tree_frame = ttk.Frame(login_tab)
+        tree_frame.pack(fill='both', expand=True, padx=4, pady=4)
+
+        columns = ('email', 'protocol', 'server', 'status', 'progress')
+        self.login_tree = ttk.Treeview(tree_frame, columns=columns, show='headings', selectmode='extended', height=14)
+        self.login_tree.heading('email', text='Email Address')
+        self.login_tree.heading('protocol', text='Protocol')
+        self.login_tree.heading('server', text='Server')
+        self.login_tree.heading('status', text='Status')
+        self.login_tree.heading('progress', text='Progress')
+        self.login_tree.column('email', width=220, anchor='w')
+        self.login_tree.column('protocol', width=70, anchor='center')
+        self.login_tree.column('server', width=200, anchor='w')
+        self.login_tree.column('status', width=140, anchor='w')
+        self.login_tree.column('progress', width=160, anchor='w')
+
+        vscroll = ttk.Scrollbar(tree_frame, orient='vertical', command=self.login_tree.yview)
+        self.login_tree.configure(yscrollcommand=vscroll.set)
+        self.login_tree.pack(side='left', fill='both', expand=True)
+        vscroll.pack(side='right', fill='y')
+
+        self.login_tree.bind('<Double-Button-1>', self._on_login_double_click)
+        self.login_tree.bind('<Button-3>', self._on_login_right_click)
 
         self.login_context_menu = tk.Menu(self, tearoff=0)
-        self.login_context_menu.add_command(label='Copy Email Address', command=self.copy_email_address)
+        self.login_context_menu.add_command(label='Auto Login (IMAP then POP3)', command=self._auto_login_selected)
+        self.login_context_menu.add_command(label='Login with OAuth IMAP', command=self._oauth_login_selected_imap)
+        self.login_context_menu.add_command(label='Login with OAuth Exchange', command=self._oauth_login_selected_exchange)
+        self.login_context_menu.add_separator()
+        self.login_context_menu.add_command(label='Start Fetch for Selected', command=self._fetch_selected)
+        self.login_context_menu.add_separator()
+        self.login_context_menu.add_command(label='Use in Top Section', command=self._use_selected_in_top)
+        self.login_context_menu.add_command(label='Copy Email', command=self.copy_email_address)
         self.login_context_menu.add_command(label='Copy Password', command=self.copy_password)
-        self.login_context_menu.add_command(label='Copy Domain', command=self.copy_domain)
         self.login_context_menu.add_separator()
-        self.login_context_menu.add_command(label='Use Login', command=self.use_selected_login)
-        self.login_context_menu.add_command(label='Clear List', command=self.clear_login_list)
-        self.login_context_menu.add_separator()
-        self.login_context_menu.add_command(label='Login with OAuth IMAP', command=self.office_oauth_imap)
-        self.login_context_menu.add_command(label='Office OAuth Login (Exchange)', command=self.office_oauth_exchange)
+        self.login_context_menu.add_command(label='Reset Status', command=self._reset_selected_status)
+        self.login_context_menu.add_command(label='Remove Entry', command=self._remove_selected_login)
 
     def _build_search_tab(self, notebook: ttk.Notebook) -> None:
         search_tab = ttk.Frame(notebook)
@@ -525,6 +476,43 @@ class MailListFetcherGUI(tk.Tk):
         ttk.Entry(output_frame, textvariable=self.output_var, width=60).grid(row=0, column=1, sticky='w', padx=8, pady=6)
         ttk.Button(output_frame, text='Browse', command=self.choose_output_folder).grid(row=0, column=2, sticky='w', padx=8, pady=6)
 
+    def _on_server_selected(self, event: tk.Event | None = None) -> None:
+        idx = self.server_combo.current()
+        if 0 <= idx < len(self._server_options):
+            proto, server, port, encryption, url = self._server_options[idx]
+            self.provider_var.set(proto if proto in ('IMAP', 'POP3', 'Exchange') else 'IMAP')
+            if server:
+                self.server_var.set(server)
+            if port:
+                self.port_var.set(str(port))
+            if encryption and encryption.upper() == 'SSL':
+                self.ssl_var.set(True)
+            elif encryption and encryption.upper() in ('', 'NONE', 'STARTTLS'):
+                self.ssl_var.set(False)
+
+    def _detect_all_servers(self) -> None:
+        email = self.email_var.get().strip()
+        if '@' not in email:
+            messagebox.showwarning('Detect Servers', 'Please enter a valid email address.')
+            return
+        domain = email.split('@', 1)[1]
+        rules = core.IniLoader.load_server_rules(self.server_path)
+        servers = core.ServerResolver.find_all_servers(domain, rules)
+        self._server_options = servers
+        values = []
+        for proto, server, port, enc, url in servers:
+            display = f'{proto}: {server or url}'
+            if port:
+                display += f':{port}'
+            if enc:
+                display += f' ({enc})'
+            values.append(display)
+        self.server_combo['values'] = values
+        if values:
+            self.server_combo.current(0)
+            self._on_server_selected()
+        self.append_log(f'Detected {len(servers)} server(s) for {domain}\n')
+
     def _update_port_label(self) -> None:
         provider = self.provider_var.get()
         if provider == 'IMAP':
@@ -549,18 +537,11 @@ class MailListFetcherGUI(tk.Tk):
         server, port, encryption, url = core.ServerResolver.choose_server(domain, provider, core.IniLoader.load_server_rules(self.server_path))
         if server:
             self.server_var.set(server)
-        if port:
-            self.port_var.set(str(port))
-        if encryption and encryption.upper() == 'SSL':
-            self.ssl_var.set(True)
-        self.append_log(f'Autodetected server: {server}:{port} (encryption={encryption})\n')
-
-    def open_config_folder(self) -> None:
-        try:
-            import subprocess
-            subprocess.Popen(['explorer', str(self.script_dir)])
-        except Exception:
-            messagebox.showinfo('Open Folder', f'Config folder: {self.script_dir}')
+            if port:
+                self.port_var.set(str(port))
+            if encryption and encryption.upper() == 'SSL':
+                self.ssl_var.set(True)
+            self.append_log(f'Autodetected server: {server}:{port} (encryption={encryption})\n')
 
     def load_configuration(self) -> None:
         try:
@@ -675,6 +656,8 @@ class MailListFetcherGUI(tk.Tk):
 
         self.append_log('Saved filter configuration to Config.ini\n')
 
+    # ─── Login list management ───
+
     def choose_login_file(self) -> None:
         file_path = filedialog.askopenfilename(
             initialdir=self.script_dir,
@@ -690,7 +673,6 @@ class MailListFetcherGUI(tk.Tk):
         self.login_entries = []
         try:
             if not self.login_file.exists():
-                print(f'Login file not found: {self.login_file}')
                 return
             with self.login_file.open('r', encoding='utf-8', errors='ignore') as fp:
                 for raw in fp:
@@ -704,11 +686,11 @@ class MailListFetcherGUI(tk.Tk):
                         email, password, domain = parts[0], parts[1], ''
                     else:
                         email, password, domain = parts[0], parts[1], parts[2]
-                    self.login_entries.append((email, password, domain))
-            self._refresh_login_listbox()
+                    if email:
+                        self.login_entries.append(LoginEntry(email=email, password=password, domain=domain))
+            self._refresh_login_tree()
             self.append_log(f'Loaded {len(self.login_entries)} login entries from {self.login_file}\n')
         except Exception as e:
-            print(f'Error loading login file: {e}')
             self.append_log(f'Error loading login file: {e}\n')
 
     def save_login_file(self) -> None:
@@ -716,16 +698,16 @@ class MailListFetcherGUI(tk.Tk):
             messagebox.showinfo('Save Login File', 'No login entries to save.')
             return
         with self.login_file.open('w', encoding='utf-8', newline='') as fp:
-            for email, password, domain in self.login_entries:
-                parts = [email, password]
-                if domain:
-                    parts.append(domain)
+            for entry in self.login_entries:
+                parts = [entry.email, entry.password]
+                if entry.domain:
+                    parts.append(entry.domain)
                 fp.write('|'.join(parts) + '\n')
         self.append_log(f'Saved {len(self.login_entries)} login entries to {self.login_file}\n')
 
     def clear_login_list(self) -> None:
         self.login_entries = []
-        self._refresh_login_listbox()
+        self._refresh_login_tree()
         self.append_log('Cleared login list\n')
 
     def add_current_login(self) -> None:
@@ -735,27 +717,45 @@ class MailListFetcherGUI(tk.Tk):
             messagebox.showwarning('Add Login', 'Email is required to add a login entry.')
             return
         domain = email.split('@', 1)[-1] if '@' in email else ''
-        self.login_entries.append((email, password, domain))
-        self._refresh_login_listbox()
+        self.login_entries.append(LoginEntry(email=email, password=password, domain=domain))
+        self._refresh_login_tree()
         self.append_log(f'Added login entry: {email}\n')
 
-    def _refresh_login_listbox(self) -> None:
-        if self.login_listbox is None:
+    def _refresh_login_tree(self) -> None:
+        if self.login_tree is None:
             return
-        self.login_listbox.delete(0, 'end')
-        for email, password, domain in self.login_entries:
-            display = email
-            if domain:
-                display += f' ({domain})'
-            self.login_listbox.insert('end', display)
+        self.login_tree.delete(*self.login_tree.get_children())
+        for entry in self.login_entries:
+            self.login_tree.insert('', 'end', values=(entry.email, entry.protocol, entry.server, entry.status, entry.progress))
+
+    def _update_login_tree_row(self, entry: LoginEntry) -> None:
+        if self.login_tree is None:
+            return
+        idx = self.login_entries.index(entry) if entry in self.login_entries else -1
+        if idx < 0:
+            return
+        children = self.login_tree.get_children()
+        if idx < len(children):
+            self.login_tree.item(children[idx], values=(entry.email, entry.protocol, entry.server, entry.status, entry.progress))
+
+    def _selected_login_indices(self) -> list[int]:
+        if self.login_tree is None:
+            return []
+        selection = self.login_tree.selection()
+        indices = []
+        children = self.login_tree.get_children()
+        for sel in selection:
+            try:
+                indices.append(children.index(sel))
+            except ValueError:
+                pass
+        return indices
 
     def _selected_login_index(self) -> int:
-        if self.login_listbox is None:
-            return -1
-        selection = self.login_listbox.curselection()
-        return selection[0] if selection else -1
+        indices = self._selected_login_indices()
+        return indices[0] if indices else -1
 
-    def _get_selected_login(self) -> tuple[str, str, str] | None:
+    def _get_selected_login(self) -> LoginEntry | None:
         idx = self._selected_login_index()
         if idx < 0 or idx >= len(self.login_entries):
             return None
@@ -765,56 +765,343 @@ class MailListFetcherGUI(tk.Tk):
         self.email_var.set(email)
         self.password_var.set(password)
         if domain:
-            self.server_var.set(f'imap.{domain}')
-            self.port_var.set('993')
-            self.ssl_var.set(True)
+            rules = core.IniLoader.load_server_rules(self.server_path)
+            server, port, enc, _ = core.ServerResolver.choose_server(domain, 'IMAP', rules)
+            if server:
+                self.server_var.set(server)
+            if port:
+                self.port_var.set(str(port))
+            if enc and enc.upper() == 'SSL':
+                self.ssl_var.set(True)
 
-    def use_selected_login(self) -> None:
-        tmpl = self._get_selected_login()
-        if tmpl is None:
+    def _use_selected_in_top(self) -> None:
+        entry = self._get_selected_login()
+        if entry is None:
             messagebox.showwarning('Use Login', 'No login entry selected.')
             return
-        email, password, domain = tmpl
-        self._set_login_fields(email, password, domain)
-        self.append_log(f'Selected login: {email}\n')
+        self._set_login_fields(entry.email, entry.password, entry.domain)
+        self.append_log(f'Selected login: {entry.email}\n')
 
     def copy_email_address(self) -> None:
-        tmpl = self._get_selected_login()
-        if tmpl is None:
+        entry = self._get_selected_login()
+        if entry is None:
             return
         self.clipboard_clear()
-        self.clipboard_append(tmpl[0])
-        self.append_log(f'Copied email address: {tmpl[0]}\n')
+        self.clipboard_append(entry.email)
 
     def copy_password(self) -> None:
-        tmpl = self._get_selected_login()
-        if tmpl is None:
+        entry = self._get_selected_login()
+        if entry is None:
             return
         self.clipboard_clear()
-        self.clipboard_append(tmpl[1])
-        self.append_log('Copied password to clipboard\n')
+        self.clipboard_append(entry.password)
 
-    def copy_domain(self) -> None:
-        tmpl = self._get_selected_login()
-        if tmpl is None:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(tmpl[2])
-        self.append_log(f'Copied domain: {tmpl[2]}\n')
+    def _remove_selected_login(self) -> None:
+        indices = sorted(self._selected_login_indices(), reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.login_entries):
+                del self.login_entries[idx]
+        self._refresh_login_tree()
 
-    def on_login_double_click(self, event: tk.Event) -> None:
-        self.use_selected_login()
+    def _reset_selected_status(self) -> None:
+        for idx in self._selected_login_indices():
+            if 0 <= idx < len(self.login_entries):
+                self.login_entries[idx].status = STATUS_PENDING
+                self.login_entries[idx].protocol = ''
+                self.login_entries[idx].server = ''
+                self.login_entries[idx].progress = ''
+                self.login_entries[idx].fetching = False
+                self._update_login_tree_row(self.login_entries[idx])
 
-    def on_login_right_click(self, event: tk.Event) -> None:
-        if self.login_listbox is None:
+    def _on_login_double_click(self, event: tk.Event) -> None:
+        entry = self._get_selected_login()
+        if entry is None:
             return
-        nearest = self.login_listbox.nearest(event.y)
-        if nearest < 0:
+        self._auto_login_entry(entry)
+
+    def _on_login_right_click(self, event: tk.Event) -> None:
+        if self.login_tree is None:
             return
-        self.login_listbox.selection_clear(0, 'end')
-        self.login_listbox.selection_set(nearest)
-        if self.login_context_menu:
-            self.login_context_menu.tk_popup(event.x_root, event.y_root)
+        item = self.login_tree.identify_row(event.y)
+        if item:
+            self.login_tree.selection_set(item)
+            if self.login_context_menu:
+                self.login_context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _auto_login_selected(self) -> None:
+        entry = self._get_selected_login()
+        if entry is None:
+            return
+        self._auto_login_entry(entry)
+
+    def _oauth_login_selected_imap(self) -> None:
+        entry = self._get_selected_login()
+        if entry is None:
+            return
+        self.email_var.set(entry.email)
+        self._start_oauth_login('IMAP', entry)
+
+    def _oauth_login_selected_exchange(self) -> None:
+        entry = self._get_selected_login()
+        if entry is None:
+            return
+        self.email_var.set(entry.email)
+        self._start_oauth_login('Exchange', entry)
+
+    def _fetch_selected(self) -> None:
+        for idx in self._selected_login_indices():
+            if 0 <= idx < len(self.login_entries):
+                entry = self.login_entries[idx]
+                if entry.status == STATUS_LOGGED_IN and not entry.fetching:
+                    self._start_fetch_for_entry(entry)
+
+    # ─── Auto login logic ───
+
+    def _auto_login_entry(self, entry: LoginEntry) -> None:
+        if not entry.password:
+            entry.status = STATUS_LOGIN_FAILED
+            entry.protocol = '-'
+            entry.server = '-'
+            entry.progress = 'No password - right-click for OAuth'
+            self._update_login_tree_row(entry)
+            self.append_log(f'{entry.email}: No password provided. Right-click to use OAuth.\n')
+            return
+
+        domain = entry.domain or (entry.email.split('@', 1)[-1] if '@' in entry.email else '')
+        if not domain:
+            entry.status = STATUS_ERROR
+            entry.progress = 'Cannot determine domain'
+            self._update_login_tree_row(entry)
+            return
+
+        entry.status = STATUS_DETECTING
+        entry.progress = ''
+        self._update_login_tree_row(entry)
+
+        rules = core.IniLoader.load_server_rules(self.server_path)
+        servers = core.ServerResolver.find_all_servers(domain, rules)
+
+        imap_servers = [(s, p, e) for proto, s, p, e, _ in servers if proto == 'IMAP' and s]
+        pop3_servers = [(s, p, e) for proto, s, p, e, _ in servers if proto == 'POP3' and s]
+
+        if not imap_servers and not pop3_servers:
+            imap_servers = [(f'imap.{domain}', 993, 'SSL')]
+            pop3_servers = [(f'pop.{domain}', 995, 'SSL')]
+
+        threading.Thread(
+            target=self._try_auto_login,
+            args=(entry, imap_servers, pop3_servers),
+            daemon=True,
+        ).start()
+
+    def _try_auto_login(self, entry: LoginEntry, imap_servers: list, pop3_servers: list) -> None:
+        self.after(0, lambda: self.append_log(f'{entry.email}: Auto-login starting (IMAP then POP3)...\n'))
+
+        for server, port, encryption in imap_servers:
+            entry.status = STATUS_TRYING_IMAP
+            entry.protocol = 'IMAP'
+            entry.server = server
+            entry.progress = f'Trying {server}:{port}...'
+            self.after(0, lambda e=entry: self._update_login_tree_row(e))
+            self.after(0, lambda s=server, p=port: self.append_log(f'{entry.email}: Trying IMAP {s}:{p}...\n'))
+            if self._test_imap_login(entry.email, entry.password, server, port, encryption):
+                entry.status = STATUS_LOGGED_IN
+                entry.progress = 'Ready to fetch'
+                self.after(0, lambda e=entry: self._update_login_tree_row(e))
+                self.after(0, lambda: self.append_log(f'{entry.email}: IMAP login succeeded on {server}\n'))
+                return
+
+        for server, port, encryption in pop3_servers:
+            entry.status = STATUS_TRYING_POP3
+            entry.protocol = 'POP3'
+            entry.server = server
+            entry.progress = f'Trying {server}:{port}...'
+            self.after(0, lambda e=entry: self._update_login_tree_row(e))
+            self.after(0, lambda s=server, p=port: self.append_log(f'{entry.email}: Trying POP3 {s}:{p}...\n'))
+            if self._test_pop3_login(entry.email, entry.password, server, port, encryption):
+                entry.status = STATUS_LOGGED_IN
+                entry.progress = 'Ready to fetch'
+                self.after(0, lambda e=entry: self._update_login_tree_row(e))
+                self.after(0, lambda: self.append_log(f'{entry.email}: POP3 login succeeded on {server}\n'))
+                return
+
+        entry.status = STATUS_LOGIN_FAILED
+        entry.protocol = '-'
+        entry.progress = 'Right-click for OAuth'
+        self.after(0, lambda e=entry: self._update_login_tree_row(e))
+        self.after(0, lambda: self.append_log(f'{entry.email}: Auto-login failed. Right-click to try OAuth.\n'))
+
+    def _test_imap_login(self, email: str, password: str, server: str, port: int | None, encryption: str | None) -> bool:
+        import imaplib
+        import ssl as ssl_mod
+        timeout = int(self.timeout_var.get() or '30')
+        use_ssl = encryption and encryption.upper() == 'SSL'
+        conn = None
+        try:
+            if use_ssl:
+                ctx = ssl_mod.create_default_context()
+                conn = imaplib.IMAP4_SSL(server, port or 993, ssl_context=ctx, timeout=timeout)
+            else:
+                conn = imaplib.IMAP4(server, port or 143, timeout=timeout)
+            conn.login(email, password)
+            conn.logout()
+            return True
+        except Exception:
+            if conn:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+            return False
+
+    def _test_pop3_login(self, email: str, password: str, server: str, port: int | None, encryption: str | None) -> bool:
+        import poplib
+        import ssl as ssl_mod
+        timeout = int(self.timeout_var.get() or '30')
+        use_ssl = encryption and encryption.upper() == 'SSL'
+        conn = None
+        try:
+            if use_ssl:
+                ctx = ssl_mod.create_default_context()
+                conn = poplib.POP3_SSL(server, port or 995, context=ctx, timeout=timeout)
+            else:
+                conn = poplib.POP3(server, port or 110, timeout=timeout)
+            conn.user(email)
+            conn.pass_(password)
+            conn.quit()
+            return True
+        except Exception:
+            if conn:
+                try:
+                    conn.quit()
+                except Exception:
+                    pass
+            return False
+
+    def _login_all_entries(self) -> None:
+        for entry in self.login_entries:
+            if entry.status in (STATUS_PENDING, STATUS_LOGIN_FAILED, STATUS_ERROR):
+                self._auto_login_entry(entry)
+                time.sleep(0.3)
+
+    # ─── Fetch for entries ───
+
+    def _fetch_all_logged_in(self) -> None:
+        for entry in self.login_entries:
+            if entry.status == STATUS_LOGGED_IN and not entry.fetching:
+                self._start_fetch_for_entry(entry)
+                time.sleep(0.2)
+
+    def _start_fetch_for_entry(self, entry: LoginEntry) -> None:
+        if entry.fetching:
+            return
+        if entry.status != STATUS_LOGGED_IN:
+            messagebox.showwarning('Fetch', f'{entry.email} is not logged in.')
+            return
+
+        settings = self._build_fetch_settings()
+        config = self._build_fetch_config()
+        output_dir = Path(self.output_var.get().strip() or self.script_dir / 'output') / entry.email.replace('@', '_at_')
+        use_ssl = True
+        server = entry.server
+        port = None
+        protocol = entry.protocol
+
+        rules = core.IniLoader.load_server_rules(self.server_path)
+        if server and '@' not in server and '#' not in server:
+            try:
+                port_str = server.split(':')[-1] if ':' in server else None
+                if port_str and port_str.isdigit():
+                    port = int(port_str)
+                    server = server.rsplit(':', 1)[0]
+            except Exception:
+                pass
+
+        if not port:
+            if protocol == 'IMAP':
+                port = 993
+            elif protocol == 'POP3':
+                port = 995
+
+        oauth_token = None
+        oauth_token_data = None
+        if entry.oauth_session:
+            if protocol == 'IMAP':
+                oauth_token = entry.oauth_session.access_token
+                server = 'outlook.office365.com'
+                port = 993
+                use_ssl = True
+            elif protocol == 'Exchange':
+                oauth_token_data = entry.oauth_session.token_result
+
+        def progress_cb(email_addr, status_msg, current, total, folder):
+            if total > 0:
+                prog = f'{current}/{total}'
+                if folder:
+                    prog = f'{folder}: {prog}'
+            else:
+                prog = status_msg
+            entry.progress = prog
+            entry.status = STATUS_FETCHING
+            self.after(0, lambda: self._update_login_tree_row(entry))
+
+        fetcher: core.BaseFetcher
+        if protocol == 'IMAP':
+            fetcher = core.IMAPFetcher(
+                entry.email, entry.password, server, port, use_ssl, settings, config, output_dir,
+                oauth_access_token=oauth_token, progress_callback=progress_cb
+            )
+        elif protocol == 'POP3':
+            fetcher = core.POPFetcher(
+                entry.email, entry.password, server, port, use_ssl, settings, config, output_dir,
+                progress_callback=progress_cb
+            )
+        else:
+            if not core.EXCHANGE_AVAILABLE:
+                self.append_log(f'{entry.email}: Exchange not available (install exchangelib)\n')
+                return
+            fetcher = core.ExchangeFetcher(
+                entry.email, entry.password, server, port, use_ssl, settings, config, output_dir,
+                oauth_token_data=oauth_token_data, oauth_client_id=self.oauth_client_id,
+                progress_callback=progress_cb
+            )
+
+        entry.fetcher = fetcher
+        entry.fetching = True
+        entry.status = STATUS_FETCHING
+        entry.progress = 'Starting...'
+        self._update_login_tree_row(entry)
+
+        threading.Thread(
+            target=self._run_entry_fetch,
+            args=(entry, fetcher),
+            daemon=True,
+        ).start()
+
+    def _run_entry_fetch(self, entry: LoginEntry, fetcher: core.BaseFetcher) -> None:
+        old_stdout = sys.stdout
+        try:
+            sys.stdout = TextRedirector(self.append_log)
+            self.append_log(f'{entry.email}: Starting email fetch...\n')
+            fetcher.fetch()
+            self.after(0, lambda: self.append_log(f'{entry.email}: Fetch completed.\n'))
+            entry.status = STATUS_COMPLETED
+            entry.progress = f'{len(fetcher.results)} emails'
+        except InterruptedError:
+            entry.status = STATUS_STOPPED
+            entry.progress = 'Aborted'
+            self.after(0, lambda: self.append_log(f'{entry.email}: Fetch aborted.\n'))
+        except Exception as exc:
+            entry.status = STATUS_ERROR
+            entry.progress = str(exc)[:80]
+            self.after(0, lambda: self.append_log(f'{entry.email}: Fetch error: {exc}\n'))
+        finally:
+            sys.stdout = old_stdout
+            entry.fetching = False
+            entry.fetcher = None
+            self.after(0, lambda: self._update_login_tree_row(entry))
+
+    # ─── OAuth ───
 
     def office_oauth_imap(self) -> None:
         self._start_oauth_login('IMAP')
@@ -824,34 +1111,41 @@ class MailListFetcherGUI(tk.Tk):
 
     def _check_webview_available(self) -> bool:
         try:
-            import webview  # noqa: F401
+            import webview
             try:
-                import webview.platforms  # noqa: F401
+                import webview.platforms
                 return True
             except (ImportError, Exception):
                 return False
         except ImportError:
             return False
 
-    def _start_oauth_login(self, provider: str) -> None:
+    def _start_oauth_login(self, provider: str, target_entry: LoginEntry | None = None) -> None:
         if self._oauth_in_progress:
             messagebox.showinfo('OAuth In Progress', 'An OAuth login is already running.')
             return
         try:
-            import msal  # noqa: F401
+            import msal
         except ImportError:
             messagebox.showerror('OAuth Missing', 'The msal library is required for OAuth login. Install it with: pip install msal')
             return
 
         email = self.email_var.get().strip()
-        selected_login = self._get_selected_login()
-        if selected_login is not None:
-            email = selected_login[0]
+        if target_entry:
+            email = target_entry.email
 
         cli_id = self.oauth_client_id or 'e9a7fea1-1cc0-4cd9-a31b-9137ca5deedd'
         authority = self.oauth_authority.strip() if self.oauth_authority else 'https://login.microsoftonline.com/common'
         scope = ['https://outlook.office.com/IMAP.AccessAsUser.All'] if provider == 'IMAP' else ['https://outlook.office365.com/EWS.AccessAsUser.All']
         self._oauth_in_progress = True
+        self._auto_login_for_entry = target_entry
+
+        if target_entry:
+            target_entry.status = STATUS_OAUTH_PENDING
+            target_entry.protocol = provider
+            target_entry.progress = 'Waiting for browser...'
+            self._update_login_tree_row(target_entry)
+
         self._set_main_window_enabled(False)
         self.append_log(f'Starting OAuth login for {provider}...\n')
 
@@ -871,11 +1165,6 @@ class MailListFetcherGUI(tk.Tk):
                 args=(provider, cli_id, authority, email, scope),
                 daemon=True,
             ).start()
-
-    def _office_oauth(self, provider: str) -> None:
-        if provider in ('IMAP', 'Exchange'):
-            self._start_oauth_login(provider)
-            return
 
     def _run_oauth_flow_system_browser(self, provider: str, cli_id: str, authority: str, email: str, scope: list[str]) -> None:
         try:
@@ -1012,7 +1301,7 @@ class MailListFetcherGUI(tk.Tk):
             self.after(0, lambda: messagebox.showerror('OAuth Error', f'Unable to start OAuth {provider}: {exc}'))
             self.after(0, lambda: self.append_log(f'OAuth {provider} startup failed: {exc}\n'))
             self.after(0, self._clear_oauth_progress)
-            self.after(0, self._set_main_window_enabled, True)
+            self.after(0, lambda: self._set_main_window_enabled(True))
 
     def _launch_oauth_helper(self, provider: str, cli_id: str, authority: str, email: str, scope: list[str], window_x: int, window_y: int, window_width: int, window_height: int) -> None:
         helper_fd, helper_path = tempfile.mkstemp(prefix='oauth_result_', suffix='.json')
@@ -1026,28 +1315,17 @@ class MailListFetcherGUI(tk.Tk):
             sys.executable,
             str(Path(__file__).resolve()),
             '--oauth-helper',
-            '--provider',
-            provider,
-            '--client-id',
-            cli_id,
-            '--authority',
-            authority,
-            '--email',
-            email,
-            '--scope',
-            '|'.join(scope),
-            '--result-file',
-            str(result_path),
-            '--redirect-uri',
-            redirect_uri,
-            '--window-x',
-            str(window_x),
-            '--window-y',
-            str(window_y),
-            '--window-width',
-            str(window_width),
-            '--window-height',
-            str(window_height),
+            '--provider', provider,
+            '--client-id', cli_id,
+            '--authority', authority,
+            '--email', email,
+            '--scope', '|'.join(scope),
+            '--result-file', str(result_path),
+            '--redirect-uri', redirect_uri,
+            '--window-x', str(window_x),
+            '--window-y', str(window_y),
+            '--window-width', str(window_width),
+            '--window-height', str(window_height),
         ]
 
         creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -1110,6 +1388,11 @@ class MailListFetcherGUI(tk.Tk):
                 error_text = str(payload.get('error', 'OAuth failed.'))
                 messagebox.showerror('OAuth Failed', error_text)
                 self.append_log(f'OAuth {provider} failed: {error_text}\n')
+                if self._auto_login_for_entry:
+                    self._auto_login_for_entry.status = STATUS_LOGIN_FAILED
+                    self._auto_login_for_entry.progress = f'OAuth failed: {error_text[:60]}'
+                    self._update_login_tree_row(self._auto_login_for_entry)
+                    self._auto_login_for_entry = None
                 return
 
             token_result = payload.get('token_result')
@@ -1123,10 +1406,11 @@ class MailListFetcherGUI(tk.Tk):
             refresh_token = token_result.get('refresh_token', '')
             expires_in = token_result.get('expires_in', 3600)
             expiry_time = time.time() + int(expires_in) if isinstance(expires_in, (int, float)) and expires_in else None
+            email_addr = str(payload.get('email', self.email_var.get().strip()))
 
             self._complete_oauth_login(
                 provider=provider,
-                email=str(payload.get('email', self.email_var.get().strip())),
+                email=email_addr,
                 access_token=access_token,
                 authority=str(payload.get('authority', self.oauth_authority)),
                 cli_id=str(payload.get('client_id', self.oauth_client_id)),
@@ -1179,7 +1463,7 @@ class MailListFetcherGUI(tk.Tk):
             pass
 
     def _complete_oauth_login(self, provider: str, email: str, access_token: str, authority: str, cli_id: str, token_result: dict[str, object] | None = None, expires_in: object = '', refresh_token: str = '', expiry_time: float | None = None) -> None:
-        self.oauth_session = OAuthSessionState(
+        oauth_state = OAuthSessionState(
             provider=provider,
             email=email,
             access_token=access_token,
@@ -1189,8 +1473,8 @@ class MailListFetcherGUI(tk.Tk):
             refresh_token=refresh_token or None,
             token_expiry=expiry_time,
         )
-        
-        # Save token securely
+        self.oauth_session = oauth_state
+
         if token_result:
             self.save_oauth_token(provider, email, {
                 'access_token': access_token,
@@ -1198,7 +1482,7 @@ class MailListFetcherGUI(tk.Tk):
                 'expires_in': expires_in,
                 'token_result': token_result,
             })
-        
+
         self.email_var.set(email)
         self.provider_var.set(provider)
         if provider == 'IMAP':
@@ -1215,11 +1499,24 @@ class MailListFetcherGUI(tk.Tk):
             self.oauth_status_label.configure(text=f'OAuth: {provider} token active', foreground='green')
         except Exception:
             pass
-        self._clear_oauth_progress()
-        
-        # Auto-start fetch without messagebox
-        self.append_log(f'Starting automatic email fetch after OAuth login...\n')
-        self.after(500, self.start_fetch)
+
+        target_entry = self._auto_login_for_entry
+        if target_entry:
+            target_entry.oauth_session = oauth_state
+            target_entry.status = STATUS_LOGGED_IN
+            target_entry.protocol = provider
+            if provider == 'IMAP':
+                target_entry.server = 'outlook.office365.com'
+            target_entry.progress = 'OAuth OK - ready to fetch'
+            self._update_login_tree_row(target_entry)
+            self.append_log(f'{email}: OAuth login succeeded. Starting fetch automatically...\n')
+            self._auto_login_for_entry = None
+            self._clear_oauth_progress()
+            self.after(500, lambda: self._start_fetch_for_entry(target_entry))
+        else:
+            self.append_log(f'Starting automatic email fetch after OAuth login...\n')
+            self._clear_oauth_progress()
+            self.after(500, self.start_fetch)
 
     def _clear_oauth_progress(self) -> None:
         self._oauth_in_progress = False
@@ -1263,6 +1560,8 @@ class MailListFetcherGUI(tk.Tk):
         except Exception as exc:
             self.append_log(f'OAuth token refresh error: {exc}\n')
 
+    # ─── Fetch (top section) ───
+
     def _build_fetch_settings(self) -> core.FetchSettings:
         settings = core.FetchSettings(
             thread_count=int(self.thread_count_var.get() or '1'),
@@ -1301,16 +1600,8 @@ class MailListFetcherGUI(tk.Tk):
                 if self.oauth_session.refresh_token:
                     self.append_log('OAuth token expired, attempting refresh...\n')
                     self._try_refresh_oauth_token(provider, email_addr)
-                    if self.oauth_session.token_expiry and time.time() > self.oauth_session.token_expiry - 60:
-                        messagebox.showwarning('OAuth Expired', 'OAuth token has expired and refresh failed. Please log in again.')
-                        self.oauth_session = None
-                        try:
-                            self.oauth_status_label.configure(text='OAuth: token expired', foreground='orange')
-                        except Exception:
-                            pass
-                        return
-                else:
-                    messagebox.showwarning('OAuth Expired', 'OAuth token has expired. Please log in again.')
+                if self.oauth_session.token_expiry and time.time() > self.oauth_session.token_expiry - 60:
+                    messagebox.showwarning('OAuth Expired', 'OAuth token has expired and refresh failed. Please log in again.')
                     self.oauth_session = None
                     try:
                         self.oauth_status_label.configure(text='OAuth: token expired', foreground='orange')
@@ -1333,15 +1624,16 @@ class MailListFetcherGUI(tk.Tk):
         self.start_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
         self.status_label.configure(text='Running...')
-        self._clear_status_tree()
-        self._update_status(email_addr, 'Initializing...', '')
         threading.Thread(target=self._run_fetch, args=(fetcher,), daemon=True).start()
 
     def stop_fetch(self) -> None:
         if self.fetcher:
             self.fetcher.request_abort()
-            self.append_log('Stop requested. Terminating as soon as possible...\n')
-            self.stop_button.configure(state='disabled')
+        for entry in self.login_entries:
+            if entry.fetcher:
+                entry.fetcher.request_abort()
+        self.append_log('Stop requested. Terminating as soon as possible...\n')
+        self.stop_button.configure(state='disabled')
 
     def _create_fetcher(self) -> core.BaseFetcher:
         settings = self._build_fetch_settings()
@@ -1384,34 +1676,17 @@ class MailListFetcherGUI(tk.Tk):
         if not password and not oauth_token_data:
             raise ValueError('Enter a password or complete OAuth Exchange login before starting the fetch.')
         return core.ExchangeFetcher(
-            email_addr,
-            password,
-            server,
-            port,
-            ssl_enabled,
-            settings,
-            config,
-            output_dir,
-            oauth_access_token=None,
-            oauth_token_data=oauth_token_data,
-            oauth_client_id=self.oauth_client_id,
+            email_addr, password, server, port, ssl_enabled, settings, config, output_dir,
+            oauth_access_token=None, oauth_token_data=oauth_token_data, oauth_client_id=self.oauth_client_id,
         )
 
     def _run_fetch(self, fetcher: core.BaseFetcher) -> None:
+        old_stdout = sys.stdout
         try:
-            def status_update_callback(email: str, connection_status: str, fetch_progress: str) -> None:
-                """Callback for status updates from the fetch process."""
-                self.after(0, self._update_status, email or fetcher.email_address, connection_status, fetch_progress)
-            
-            sys.stdout = StatusAwareTextRedirector(self.append_log, status_update_callback)
-            try:
-                self.append_log('Starting fetch operation...\n')
-                fetcher.fetch()
-                self.append_log('Fetch operation completed.\n')
-                self.after(0, self._update_status, fetcher.email_address, '', 'Completed')
-            finally:
-                sys.stdout = self.stdout_backup
-
+            sys.stdout = TextRedirector(self.append_log)
+            self.append_log('Starting fetch operation...\n')
+            fetcher.fetch()
+            self.append_log('Fetch operation completed.\n')
         except InterruptedError:
             self.append_log('Fetch aborted by user.\n')
         except Exception as exc:
@@ -1419,12 +1694,15 @@ class MailListFetcherGUI(tk.Tk):
             self.append_log(f'Error: {message}\n')
             self.after(0, lambda: messagebox.showerror('Fetch Error', message))
         finally:
+            sys.stdout = old_stdout
             self.after(0, self._finish_fetch)
 
     def _finish_fetch(self) -> None:
         self.start_button.configure(state='normal')
         self.stop_button.configure(state='disabled')
         self.status_label.configure(text='Ready')
+
+    # ─── Logging ───
 
     def append_log(self, message: str) -> None:
         if threading.get_ident() != self.main_thread_id:
@@ -1434,7 +1712,7 @@ class MailListFetcherGUI(tk.Tk):
 
     def _append_log_now(self, message: str) -> None:
         if self.log_text is None:
-            print(message, end='')  # Fall back to stdout if log_text not ready
+            print(message, end='')
             return
         self.log_text.configure(state='normal')
         self.log_text.insert('end', message)
@@ -1450,54 +1728,21 @@ class MailListFetcherGUI(tk.Tk):
         self.after(75, self._drain_log_queue)
 
     def _process_status_updates(self) -> None:
-        """Process status updates from the fetcher thread."""
         try:
             while True:
                 update = self.status_updates_queue.get_nowait()
-                self._apply_status_update(update)
         except queue.Empty:
             pass
         self.after(75, self._process_status_updates)
-
-    def _apply_status_update(self, update: dict) -> None:
-        """Apply a status update to the tree view."""
-        if self.status_tree is None:
-            return
-        
-        email = update.get('email', '')
-        connection_status = update.get('connection_status', '')
-        fetch_progress = update.get('fetch_progress', '')
-        
-        # Find or create tree item for this email
-        item_id = self.status_tree_items.get(email)
-        if item_id is None:
-            item_id = self.status_tree.insert('', 'end', values=(email, connection_status, fetch_progress))
-            self.status_tree_items[email] = item_id
-        else:
-            # Update existing item
-            self.status_tree.item(item_id, values=(email, connection_status, fetch_progress))
-
-    def _clear_status_tree(self) -> None:
-        """Clear all items from the status tree."""
-        if self.status_tree is None:
-            return
-        for item in self.status_tree.get_children():
-            self.status_tree.delete(item)
-        self.status_tree_items.clear()
-
-    def _update_status(self, email: str, connection_status: str = '', fetch_progress: str = '') -> None:
-        """Queue a status update from the main thread."""
-        self.status_updates_queue.put({
-            'email': email,
-            'connection_status': connection_status,
-            'fetch_progress': fetch_progress,
-        })
 
     def on_close(self) -> None:
         if self.fetcher and not self.fetcher.abort_requested:
             if not messagebox.askokcancel('Quit', 'A fetch is in progress. Abort and quit?'):
                 return
             self.fetcher.request_abort()
+        for entry in self.login_entries:
+            if entry.fetcher and not entry.fetcher.abort_requested:
+                entry.fetcher.request_abort()
         self._cleanup_oauth_helper()
         self.destroy()
 
@@ -1506,74 +1751,72 @@ def _write_oauth_result(result_path: Path, payload: dict[str, object]) -> None:
     result_path.parent.mkdir(parents=True, exist_ok=True)
     with result_path.open('w', encoding='utf-8') as fp:
         json.dump(payload, fp)
-        fp.flush()
-        os.fsync(fp.fileno())
+    fp.flush()
+    os.fsync(fp.fileno())
 
 
 def _run_oauth_helper_process() -> None:
     result_path = None
     try:
-            parser = argparse.ArgumentParser(add_help=False)
-            parser.add_argument('--oauth-helper', action='store_true')
-            parser.add_argument('--provider', required=True)
-            parser.add_argument('--client-id', required=True)
-            parser.add_argument('--authority', required=True)
-            parser.add_argument('--email', default='')
-            parser.add_argument('--scope', required=True)
-            parser.add_argument('--result-file', required=True)
-            parser.add_argument('--redirect-uri', default='com.emclient.MailClient://oauth')
-            parser.add_argument('--window-x', type=int, default=120)
-            parser.add_argument('--window-y', type=int, default=120)
-            parser.add_argument('--window-width', type=int, default=840)
-            parser.add_argument('--window-height', type=int, default=620)
-            args, _ = parser.parse_known_args()
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--oauth-helper', action='store_true')
+        parser.add_argument('--provider', required=True)
+        parser.add_argument('--client-id', required=True)
+        parser.add_argument('--authority', required=True)
+        parser.add_argument('--email', default='')
+        parser.add_argument('--scope', required=True)
+        parser.add_argument('--result-file', required=True)
+        parser.add_argument('--redirect-uri', default='com.emclient.MailClient://oauth')
+        parser.add_argument('--window-x', type=int, default=120)
+        parser.add_argument('--window-y', type=int, default=120)
+        parser.add_argument('--window-width', type=int, default=840)
+        parser.add_argument('--window-height', type=int, default=620)
+        args, _ = parser.parse_known_args()
 
-            if not args.oauth_helper:
-                return
+        if not args.oauth_helper:
+            return
 
-            result_path = Path(args.result_file)
+        result_path = Path(args.result_file)
 
+        try:
+            import msal
+        except ImportError as exc:
+            _write_oauth_result(result_path, {'status': 'error', 'error': f'OAuth support is unavailable: {exc}'})
+            return
+
+        scope = [item for item in args.scope.split('|') if item]
+        redirect_uri = args.redirect_uri
+
+        webview_available = False
+        try:
+            import webview
             try:
-                import msal
-            except ImportError as exc:
-                _write_oauth_result(result_path, {'status': 'error', 'error': f'OAuth support is unavailable: {exc}'})
-                return
-
-            scope = [item for item in args.scope.split('|') if item]
-            redirect_uri = args.redirect_uri
-
-            webview_available = False
-            try:
-                import webview
-                try:
-                    import webview.platforms  # noqa: F401
-                    webview_available = True
-                except (ImportError, Exception):
-                    webview_available = False
-            except ImportError:
-                pass
-
-            # When using custom protocol handlers (not localhost), always use browser flow
-            # because the callback happens in a separate process via protocol handler
-            if redirect_uri.startswith('com.emclient.MailClient://') or not redirect_uri.startswith('http'):
+                import webview.platforms
+                webview_available = True
+            except (ImportError, Exception):
                 webview_available = False
+        except ImportError:
+            pass
 
-            app = msal.PublicClientApplication(client_id=args.client_id, authority=args.authority)
-            flow = app.initiate_auth_code_flow(
-                scopes=scope,
-                redirect_uri=redirect_uri,
-                login_hint=args.email or None,
-                prompt='consent',
-            )
+        if redirect_uri.startswith('com.emclient.MailClient://') or not redirect_uri.startswith('http'):
+            webview_available = False
 
-            if 'auth_uri' not in flow:
-                _write_oauth_result(result_path, {'status': 'error', 'error': f'Failed to create OAuth flow: {flow}'})
-                return
+        app = msal.PublicClientApplication(client_id=args.client_id, authority=args.authority)
+        flow = app.initiate_auth_code_flow(
+            scopes=scope,
+            redirect_uri=redirect_uri,
+            login_hint=args.email or None,
+            prompt='consent',
+        )
 
-            if webview_available:
-                _oauth_helper_webview_flow(app, flow, scope, result_path, args)
-            else:
-                _oauth_helper_browser_flow(app, flow, scope, result_path, args)
+        if 'auth_uri' not in flow:
+            _write_oauth_result(result_path, {'status': 'error', 'error': f'Failed to create OAuth flow: {flow}'})
+            return
+
+        if webview_available:
+            _oauth_helper_webview_flow(app, flow, scope, result_path, args)
+        else:
+            _oauth_helper_browser_flow(app, flow, scope, result_path, args)
 
     except Exception as exc:
         error_msg = f'OAuth helper process failed: {type(exc).__name__}: {exc}'
@@ -1588,16 +1831,6 @@ def _run_oauth_helper_process() -> None:
 
 
 def _oauth_helper_webview_flow(app, flow: dict, scope: list[str], result_path: Path, args) -> None:
-    try:
-        import webview
-        import msal
-    except ImportError as exc:
-        _write_oauth_result(result_path, {'status': 'error', 'error': f'Required module not available: {exc}'})
-        return
-
-    # Note: With protocol handlers (custom schemes), we should use browser flow instead
-    # because webview.start() will block and the callback happens in a separate process
-    # Fall through to browser flow
     _oauth_helper_browser_flow(app, flow, scope, result_path, args)
 
 
@@ -1645,7 +1878,6 @@ def _oauth_helper_browser_flow(app, flow: dict, scope: list[str], result_path: P
 
 
 def _handle_oauth_callback(callback_uri: str) -> None:
-    """Handle OAuth callback from protocol handler."""
     log_file = Path(tempfile.gettempdir()) / 'oauth_callback_debug.log'
 
     def log_msg(msg: str):
@@ -1664,11 +1896,9 @@ def _handle_oauth_callback(callback_uri: str) -> None:
     try:
         import msal
 
-        # Parse callback URI
         callback_params = ProtocolHandler.parse_callback_uri(callback_uri)
         log_msg(f'Parsed callback params: code={callback_params.get("code", "")[:20]}..., state={callback_params.get("state", "")}')
 
-        # Find matching PKCE file
         temp_dir = Path(tempfile.gettempdir())
         pkce_files = list(temp_dir.glob('pkce_oauth_result_*.json'))
         log_msg(f'Found {len(pkce_files)} PKCE files')
@@ -1677,7 +1907,6 @@ def _handle_oauth_callback(callback_uri: str) -> None:
             log_msg('No pending OAuth request found.')
             return
 
-        # Use the most recent PKCE file
         pkce_file = pkce_files[-1]
         log_msg(f'Using PKCE file: {pkce_file.name}')
 
@@ -1688,18 +1917,14 @@ def _handle_oauth_callback(callback_uri: str) -> None:
             log_msg(f'Failed to read PKCE data: {e}')
             return
 
-        log_msg(f'PKCE data keys: {list(pkce_data.keys())}')
-
         result_file = Path(pkce_data['result_file'])
 
-        # Check for error in callback
         if 'error' in callback_params:
             error_desc = callback_params.get('error_description', callback_params.get('error', 'Unknown error'))
             log_msg(f'Error in callback: {error_desc}')
             _write_oauth_result(result_file, {'status': 'error', 'error': str(error_desc)})
             return
 
-        # Extract code
         if 'code' not in callback_params:
             log_msg('No authorization code in callback.')
             _write_oauth_result(result_file, {'status': 'error', 'error': 'No authorization code in callback.'})
@@ -1707,24 +1932,19 @@ def _handle_oauth_callback(callback_uri: str) -> None:
 
         log_msg('Authorization code found. Exchanging for token...')
 
-        # Exchange authorization code for access token using MSAL
         try:
-            # Create MSAL app with stored credentials
             local_app = msal.PublicClientApplication(
                 client_id=pkce_data['client_id'],
                 authority=pkce_data['authority']
             )
             log_msg(f'Created MSAL app for {pkce_data["client_id"]}')
 
-            # Exchange code for tokens
             flow = pkce_data['flow']
             log_msg('Calling acquire_token_by_auth_code_flow...')
             token_result = local_app.acquire_token_by_auth_code_flow(flow, callback_params)
             log_msg(f'Token exchange result keys: {list(token_result.keys())}')
 
-            # Check if token exchange was successful
             if 'access_token' in token_result:
-                # Extract email from token result if available
                 email = ''
                 if 'account' in token_result and isinstance(token_result['account'], dict):
                     email = token_result['account'].get('username', '')
@@ -1769,7 +1989,7 @@ if __name__ == '__main__':
 
     if '--oauth-callback' in sys.argv:
         callback_idx = sys.argv.index('--oauth-callback')
-        if callback_idx + 1 < len(sys.argv):
+        if callback_idx + 1 < sys.argv:
             callback_uri = sys.argv[callback_idx + 1]
             _handle_oauth_callback(callback_uri)
     elif '--oauth-helper' in sys.argv:

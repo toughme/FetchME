@@ -203,10 +203,12 @@ class ServerResolver:
         fallback = None
         for rule in rules:
             matcher = ServerResolver.normalize(rule.matcher)
+            if matcher == '.':
+                continue
             matched = False
-            if matcher.startswith('.') and (domain.endswith(matcher) or mx.endswith(matcher)):
+            if matcher.startswith('.') and (domain.endswith(matcher) or domain == matcher[1:] or mx.endswith(matcher)):
                 matched = True
-            elif matcher == '.' or matcher == domain or matcher in mx:
+            elif matcher == domain or matcher in mx:
                 matched = True
             if not matched:
                 continue
@@ -215,6 +217,25 @@ class ServerResolver:
                     return rule.server, rule.port, rule.encryption, rule.url
                 if fallback is None:
                     fallback = (rule.server, rule.port, rule.encryption, rule.url)
+        for rule in rules:
+            matcher = ServerResolver.normalize(rule.matcher)
+            if matcher != '.':
+                continue
+            if provider_type in rule.include_type or 'ALL' in rule.include_type:
+                server = rule.server or ''
+                url = rule.url or ''
+                if '#domain#' in server:
+                    server = server.replace('#domain#', domain)
+                if '#domain#' in url:
+                    url = url.replace('#domain#', domain)
+                if '#mx#' in server:
+                    continue
+                if '#mx#' in url:
+                    continue
+                if server or url:
+                    return server or None, rule.port, rule.encryption, url or None
+                if fallback is None:
+                    fallback = (server or rule.server, rule.port, rule.encryption, url or rule.url)
         return fallback if fallback else (None, None, None, None)
 
     @staticmethod
@@ -227,6 +248,59 @@ class ServerResolver:
         if provider_type == 'POP3':
             return f'pop.{domain}', 995, 'SSL', None
         return (None, None, None, None)
+
+    @staticmethod
+    def find_all_servers(domain: str, rules: List[ServerRule], mx: Optional[str] = None) -> List[Tuple[str, Optional[str], Optional[int], Optional[str], Optional[str]]]:
+        domain_n = ServerResolver.normalize(domain)
+        mx_n = ServerResolver.normalize(mx or '')
+        seen: set = set()
+        concrete_results: List[Tuple[str, Optional[str], Optional[int], Optional[str], Optional[str]]] = []
+        template_results: List[Tuple[str, Optional[str], Optional[int], Optional[str], Optional[str]]] = []
+        for rule in rules:
+            matcher = ServerResolver.normalize(rule.matcher)
+            matched = False
+            if matcher.startswith('.') and (domain_n.endswith(matcher) or domain_n == matcher[1:] or mx_n.endswith(matcher)):
+                matched = True
+            elif matcher == '.' or matcher == domain_n or matcher in mx_n:
+                matched = True
+            if not matched:
+                continue
+            if not (rule.server or rule.url):
+                continue
+            for proto in rule.include_type.replace('&', '|').replace(',', '|').split('|'):
+                proto = proto.strip().upper()
+                if not proto or proto == 'ALL':
+                    continue
+                server = rule.server or ''
+                url = rule.url or ''
+                is_template = '#domain#' in server or '#mx#' in server or '#domain#' in url or '#mx#' in url or 'replace(' in server
+                key = (proto, server, url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entry = (proto, rule.server, rule.port, rule.encryption, rule.url)
+                if is_template:
+                    template_results.append(entry)
+                else:
+                    concrete_results.append(entry)
+        if concrete_results:
+            return concrete_results
+        resolved: List[Tuple[str, Optional[str], Optional[int], Optional[str], Optional[str]]] = []
+        for proto, server, port, enc, url in template_results:
+            if server and ('#domain#' in server or '#mx#' in server):
+                if '#domain#' in server:
+                    server = server.replace('#domain#', domain)
+                else:
+                    continue
+            if url and '#domain#' in url:
+                url = url.replace('#domain#', domain)
+            elif url and '#mx#' in url:
+                continue
+            resolved.append((proto, server or None, port, enc, url or None))
+        if not resolved:
+            resolved.append(('IMAP', f'imap.{domain}', 993, 'SSL', None))
+            resolved.append(('POP3', f'pop.{domain}', 995, 'SSL', None))
+        return resolved
 
 
 def decode_header_value(raw: str) -> str:
@@ -425,6 +499,7 @@ class BaseFetcher:
         oauth_access_token: Optional[str] = None,
         oauth_token_data: Optional[dict] = None,
         oauth_client_id: Optional[str] = None,
+        progress_callback: Optional[callable] = None,
     ):
         self.email_address = email_address
         self.password = password
@@ -440,6 +515,14 @@ class BaseFetcher:
         self.results: List[Dict[str, str]] = []
         self.abort_requested = False
         self._log_handler: Optional[logging.FileHandler] = None
+        self.progress_callback = progress_callback
+
+    def _report_progress(self, status: str, current: int = 0, total: int = 0, folder: str = '') -> None:
+        if self.progress_callback:
+            try:
+                self.progress_callback(self.email_address, status, current, total, folder)
+            except Exception:
+                pass
 
     def _setup_logging(self) -> None:
         if self.settings.save_log:
@@ -481,6 +564,7 @@ class IMAPFetcher(BaseFetcher):
         timeout = getattr(self.settings, 'connection_timeout', IMAP_TIMEOUT) or IMAP_TIMEOUT
         retries = getattr(self.settings, 'connection_retries', 2)
         print(f'Connecting IMAP to {self.server}:{self.port} ({mode}, timeout={timeout}s, retries={retries})')
+        self._report_progress('Connecting IMAP...')
         mail = None
         try:
             def _imap_connect():
@@ -489,19 +573,21 @@ class IMAPFetcher(BaseFetcher):
                     conn = imaplib.IMAP4_SSL(self.server, self.port or 993, ssl_context=ctx, timeout=timeout)
                 else:
                     conn = imaplib.IMAP4(self.server, self.port or 143, timeout=timeout)
-                    try:
-                        ctx = ssl.create_default_context()
-                        conn.starttls(ctx)
-                        print('IMAP STARTTLS upgraded successfully.')
-                    except imaplib.IMAP4.error:
-                        print('IMAP STARTTLS not supported by server, continuing without encryption.')
+                try:
+                    ctx = ssl.create_default_context()
+                    conn.starttls(ctx)
+                    print('IMAP STARTTLS upgraded successfully.')
+                except imaplib.IMAP4.error:
+                    print('IMAP STARTTLS not supported by server, continuing without encryption.')
                 if self.oauth_access_token:
                     auth_string = f'user={self.email_address}\x01auth=Bearer {self.oauth_access_token}\x01\x01'
                     conn.authenticate('XOAUTH2', lambda _: auth_string.encode('utf-8'))
                     print('IMAP XOAUTH2 authentication succeeded.')
+                    self._report_progress('IMAP XOAUTH2 login succeeded')
                 else:
                     conn.login(self.email_address, self.password)
                     print('IMAP login succeeded.')
+                    self._report_progress('IMAP login succeeded')
                 return conn
 
             mail = connect_with_retry(_imap_connect, retries=retries, label='IMAP')
@@ -523,11 +609,14 @@ class IMAPFetcher(BaseFetcher):
                     if name:
                         folder_names.append(name)
             print(f'Found {len(folder_names)} folders on server.')
+            self._report_progress(f'Found {len(folder_names)} folders', 0, 0, '')
+            total_fetched = 0
             for folder in folder_names:
                 self.check_abort()
                 if not folder_is_allowed(folder, self.config):
                     continue
                 print(f'Fetching folder {folder}')
+                self._report_progress(f'Searching folder: {folder}', 0, 0, folder)
                 status, _ = mail.select(f'"{folder}"', readonly=True)
                 if status != 'OK':
                     print(f'Could not select folder {folder}, skipping.')
@@ -537,12 +626,16 @@ class IMAPFetcher(BaseFetcher):
                 if status != 'OK' or not data or not data[0]:
                     continue
                 uids = data[0].split()
-                print(f'Folder {folder}: {len(uids)} messages matching criteria.')
+                total_in_folder = len(uids)
+                print(f'Folder {folder}: {total_in_folder} messages matching criteria.')
+                self._report_progress(f'Fetching {folder}', 0, total_in_folder, folder)
                 thread_count = max(1, self.settings.thread_count) if len(uids) > 20 else 1
                 if thread_count > 1:
                     self._fetch_imap_folder_parallel(folder, uids, thread_count, timeout)
                 else:
                     self._fetch_imap_folder_sequential(mail, folder, uids)
+                total_fetched += len(uids)
+                self._report_progress(f'Folder {folder} done', total_fetched, total_fetched, folder)
         except imaplib.IMAP4.error as exc:
             error_msg = str(exc)
             if 'AUTHENTICATE FAILED' in error_msg.upper() or 'LOGIN FAILED' in error_msg.upper():
@@ -579,6 +672,7 @@ class POPFetcher(BaseFetcher):
         timeout = getattr(self.settings, 'connection_timeout', POP3_TIMEOUT) or POP3_TIMEOUT
         retries = getattr(self.settings, 'connection_retries', 2)
         print(f'Connecting POP3 to {self.server}:{self.port} (timeout={timeout}s, retries={retries})')
+        self._report_progress('Connecting POP3...')
         mail = None
         try:
             def _pop3_connect():
@@ -587,22 +681,27 @@ class POPFetcher(BaseFetcher):
                     conn = poplib.POP3_SSL(self.server, self.port or 995, context=ctx, timeout=timeout)
                 else:
                     conn = poplib.POP3(self.server, self.port or 110, timeout=timeout)
-                    try:
-                        ctx = ssl.create_default_context()
-                        conn.stls(context=ctx)
-                        print('POP3 STARTTLS upgraded successfully.')
-                    except poplib.error_proto:
-                        print('POP3 STARTTLS not supported by server, continuing without encryption.')
+                try:
+                    ctx = ssl.create_default_context()
+                    conn.stls(context=ctx)
+                    print('POP3 STARTTLS upgraded successfully.')
+                except poplib.error_proto:
+                    print('POP3 STARTTLS not supported by server, continuing without encryption.')
                 conn.user(self.email_address)
                 conn.pass_(self.password)
                 print('POP3 login succeeded.')
+                self._report_progress('POP3 login succeeded')
                 return conn
 
             mail = connect_with_retry(_pop3_connect, retries=retries, label='POP3')
             count, _ = mail.stat()
             print(f'POP3: {count} messages on server.')
+            self._report_progress(f'Found {count} messages', 0, count, 'POP3')
             for msg_num in range(1, count + 1):
                 self.check_abort()
+                if msg_num % 10 == 0 or msg_num == count:
+                    self._report_progress('Fetching POP3', msg_num, count, 'POP3')
+                    print(f'Progress: {msg_num}/{count}')
                 try:
                     raw = b"\n".join(mail.retr(msg_num)[1])
                 except poplib.error_proto as exc:
@@ -684,8 +783,10 @@ class ExchangeFetcher(BaseFetcher):
 
     def fetch(self) -> List[Dict[str, str]]:
         self._setup_logging()
+        self._report_progress('Connecting Exchange...')
         try:
             account = self.connect()
+            self._report_progress('Exchange login succeeded')
         except Exception as exc:
             error_msg = str(exc)
             if 'auth' in error_msg.lower() or 'credential' in error_msg.lower() or '401' in error_msg:
@@ -776,8 +877,12 @@ class ExchangeFetcher(BaseFetcher):
         return self.results
 
     def _fetch_imap_folder_sequential(self, mail: imaplib.IMAP4, folder: str, uids: list) -> None:
+        total = len(uids)
         for idx, uid in enumerate(uids, 1):
             self.check_abort()
+            if idx % 25 == 0 or idx == total:
+                self._report_progress(f'Fetching {folder}', idx, total, folder)
+                print(f'Progress: {idx}/{total} in folder {folder}')
             try:
                 status, msg_data = mail.fetch(uid, '(BODY.PEEK[])')
             except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
