@@ -9,6 +9,7 @@ import queue
 import secrets
 import subprocess
 import sys
+import threading
 import tkinter as tk
 import urllib.parse
 import webbrowser
@@ -88,6 +89,48 @@ class ProtocolHandler:
         parsed = urllib.parse.urlparse(uri)
         params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         return params
+
+
+class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler for OAuth callback from the browser."""
+    
+    callback_data = {}
+    result_file_path = None
+    
+    def do_GET(self):
+        """Handle GET request from OAuth callback."""
+        try:
+            # Parse query parameters
+            parsed_url = urllib.parse.urlparse(self.path)
+            params = dict(urllib.parse.parse_qsl(parsed_url.query, keep_blank_values=True))
+            
+            # Store the callback data
+            OAuthCallbackHandler.callback_data = params
+            
+            # Send success response
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            html_response = """
+            <html>
+            <head><title>OAuth Sign-in Successful</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1>✓ Sign-in Successful</h1>
+                <p>You have successfully signed in.</p>
+                <p>You can close this window and return to the application.</p>
+            </body>
+            </html>
+            """
+            self.wfile.write(html_response.encode())
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(f'Error: {e}'.encode())
+    
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
 
 
 class TextRedirector(io.TextIOBase):
@@ -176,13 +219,19 @@ class MailListFetcherGUI(tk.Tk):
         self.search_subject_var = tk.BooleanVar(value=True)
         self.search_body_var = tk.BooleanVar(value=True)
 
-        self.save_content_var = tk.BooleanVar(value=True)
-        self.save_attachments_var = tk.BooleanVar(value=True)
+        # Defaults: only extract email addresses by default. Turn off saving content/attachments/logs.
+        self.save_content_var = tk.BooleanVar(value=False)
+        self.save_attachments_var = tk.BooleanVar(value=False)
         self.save_results_var = tk.BooleanVar(value=True)
-        self.save_logs_var = tk.BooleanVar(value=True)
-        self.separated_file_var = tk.BooleanVar(value=True)
+        self.save_logs_var = tk.BooleanVar(value=False)
+        self.separated_file_var = tk.BooleanVar(value=False)
         self.correct_account_var = tk.BooleanVar(value=False)
         self.thread_count_var = tk.StringVar(value='5')
+        
+        self.extract_subject_var = tk.BooleanVar(value=False)
+        self.extract_date_var = tk.BooleanVar(value=False)
+        self.extract_attachments_list_var = tk.BooleanVar(value=False)
+        self.extract_summary_var = tk.BooleanVar(value=False)
 
         self.folder_whitelist_text: tk.Text | None = None
         self.folder_blacklist_text: tk.Text | None = None
@@ -460,6 +509,14 @@ class MailListFetcherGUI(tk.Tk):
         ttk.Checkbutton(options_frame, text='Save Log Files', variable=self.save_logs_var).grid(row=1, column=1, sticky='w', padx=8, pady=4)
         ttk.Checkbutton(options_frame, text='Save Correct Account', variable=self.correct_account_var).grid(row=2, column=0, sticky='w', padx=8, pady=4)
         ttk.Checkbutton(options_frame, text='Save To Separated File', variable=self.separated_file_var).grid(row=2, column=1, sticky='w', padx=8, pady=4)
+        
+        # CSV Extraction Options
+        extraction_frame = ttk.LabelFrame(options_tab, text='Extract to CSV (Email address always included)')
+        extraction_frame.pack(fill='x', padx=8, pady=8)
+        ttk.Checkbutton(extraction_frame, text='Extract Subject', variable=self.extract_subject_var).grid(row=0, column=0, sticky='w', padx=8, pady=4)
+        ttk.Checkbutton(extraction_frame, text='Extract Date', variable=self.extract_date_var).grid(row=0, column=1, sticky='w', padx=8, pady=4)
+        ttk.Checkbutton(extraction_frame, text='Extract Attachments Info', variable=self.extract_attachments_list_var).grid(row=1, column=0, sticky='w', padx=8, pady=4)
+        ttk.Checkbutton(extraction_frame, text='Extract Summary', variable=self.extract_summary_var).grid(row=1, column=1, sticky='w', padx=8, pady=4)
 
         ttk.Label(options_frame, text='Thread Count:').grid(row=3, column=0, sticky='w', padx=8, pady=4)
         ttk.Entry(options_frame, textvariable=self.thread_count_var, width=8).grid(row=3, column=1, sticky='w', padx=8, pady=4)
@@ -558,6 +615,10 @@ class MailListFetcherGUI(tk.Tk):
             self.save_logs_var.set(settings.save_log)
             self.separated_file_var.set(settings.save_separated_file)
             self.correct_account_var.set(settings.save_correct_account)
+            self.extract_subject_var.set(settings.extract_subject)
+            self.extract_date_var.set(settings.extract_date)
+            self.extract_attachments_list_var.set(settings.extract_attachments_list)
+            self.extract_summary_var.set(settings.extract_summary)
             self.thread_count_var.set(str(settings.thread_count))
             self.oauth_client_id = settings.oauth_client_id
             self.oauth_authority = settings.oauth_authority
@@ -599,6 +660,10 @@ class MailListFetcherGUI(tk.Tk):
         settings.save_log = self.save_logs_var.get()
         settings.save_separated_file = self.separated_file_var.get()
         settings.save_correct_account = self.correct_account_var.get()
+        settings.extract_subject = self.extract_subject_var.get()
+        settings.extract_date = self.extract_date_var.get()
+        settings.extract_attachments_list = self.extract_attachments_list_var.get()
+        settings.extract_summary = self.extract_summary_var.get()
         settings.thread_count = int(self.thread_count_var.get() or '1')
         settings.oauth_client_id = self.oauth_client_id
         settings.oauth_authority = self.oauth_authority
@@ -612,6 +677,10 @@ class MailListFetcherGUI(tk.Tk):
             'ChkSaveCorrectAccount': '1' if settings.save_correct_account else '0',
             'ChkToSeparatedFile': '1' if settings.save_separated_file else '0',
             'ChkSaveEmailResult': '1' if settings.save_email_result else '0',
+            'ChkExtractSubject': '1' if settings.extract_subject else '0',
+            'ChkExtractDate': '1' if settings.extract_date else '0',
+            'ChkExtractAttachmentsList': '1' if settings.extract_attachments_list else '0',
+            'ChkExtractSummary': '1' if settings.extract_summary else '0',
             'Keyword': settings.keyword,
             'DateFrom': settings.date_from.isoformat() if settings.date_from else '',
             'DateTo': settings.date_to.isoformat() if settings.date_to else '',
@@ -858,6 +927,32 @@ class MailListFetcherGUI(tk.Tk):
     # ─── Auto login logic ───
 
     def _auto_login_entry(self, entry: LoginEntry) -> None:
+        # First, check if an OAuth token is already saved for this email
+        for provider in ['IMAP', 'Exchange']:
+            token_data = self.load_oauth_token(provider, entry.email)
+            if token_data:
+                self.append_log(f'{entry.email}: Found saved {provider} OAuth token. Using it...\n')
+                try:
+                    oauth_state = OAuthSessionState(
+                        provider=provider,
+                        email=entry.email,
+                        access_token=token_data.get('access_token', ''),
+                        authority='https://login.microsoftonline.com/common',
+                        client_id=self.oauth_client_id,
+                        token_result=token_data.get('token_result'),
+                        refresh_token=token_data.get('refresh_token'),
+                    )
+                    entry.oauth_session = oauth_state
+                    entry.status = STATUS_LOGGED_IN
+                    entry.protocol = provider
+                    entry.server = 'outlook.office365.com' if provider == 'IMAP' else 'outlook.office365.com'
+                    entry.progress = 'Ready to fetch (OAuth)'
+                    self._update_login_tree_row(entry)
+                    self.append_log(f'{entry.email}: OAuth token loaded successfully. Ready to fetch.\n')
+                    return
+                except Exception as exc:
+                    self.append_log(f'{entry.email}: Failed to load OAuth token: {exc}. Trying password login...\n')
+
         if not entry.password:
             entry.status = STATUS_LOGIN_FAILED
             entry.protocol = '-'
@@ -1094,7 +1189,7 @@ class MailListFetcherGUI(tk.Tk):
         except Exception as exc:
             entry.status = STATUS_ERROR
             entry.progress = str(exc)[:80]
-            self.after(0, lambda: self.append_log(f'{entry.email}: Fetch error: {exc}\n'))
+            self.after(0, lambda exc=exc: self.append_log(f'{entry.email}: Fetch error: {exc}\n'))
         finally:
             sys.stdout = old_stdout
             entry.fetching = False
@@ -1292,6 +1387,7 @@ class MailListFetcherGUI(tk.Tk):
 
     def _get_oauth_redirect_uri(self) -> str:
         settings = core.IniLoader.load_settings(self.settings_path)
+        # Use protocol handler URI configured in Azure
         return getattr(settings, 'oauth_redirect_uri', 'com.emclient.MailClient://oauth')
 
     def _run_oauth_flow(self, provider: str, cli_id: str, authority: str, email: str, scope: list[str], window_x: int, window_y: int, window_width: int, window_height: int) -> None:
@@ -1570,6 +1666,10 @@ class MailListFetcherGUI(tk.Tk):
             save_correct_account=self.correct_account_var.get(),
             save_separated_file=self.separated_file_var.get(),
             save_email_result=self.save_results_var.get(),
+            extract_subject=self.extract_subject_var.get(),
+            extract_date=self.extract_date_var.get(),
+            extract_attachments_list=self.extract_attachments_list_var.get(),
+            extract_summary=self.extract_summary_var.get(),
             keyword=self.keyword_var.get().strip(),
             date_from=core.parse_date_option(self.date_from_var.get().strip()) if self.date_from_var.get().strip() else None,
             date_to=core.parse_date_option(self.date_to_var.get().strip()) if self.date_to_var.get().strip() else None,
@@ -1748,11 +1848,19 @@ class MailListFetcherGUI(tk.Tk):
 
 
 def _write_oauth_result(result_path: Path, payload: dict[str, object]) -> None:
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    with result_path.open('w', encoding='utf-8') as fp:
-        json.dump(payload, fp)
-    fp.flush()
-    os.fsync(fp.fileno())
+    try:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        with result_path.open('w', encoding='utf-8') as fp:
+            json.dump(payload, fp)
+            fp.flush()
+            try:
+                os.fsync(fp.fileno())
+            except Exception:
+                pass
+    except Exception as e:
+        print(f'Error writing OAuth result: {type(e).__name__}: {e}')
+        import traceback
+        traceback.print_exc()
 
 
 def _run_oauth_helper_process() -> None:
@@ -1848,11 +1956,12 @@ def _oauth_helper_browser_flow(app, flow: dict, scope: list[str], result_path: P
                 'result_file': str(result_path),
                 'client_id': args.client_id,
                 'authority': args.authority,
+                'email': args.email or '',
             }, fp)
 
         opened = webbrowser.open(auth_url)
 
-        print(f'OAuth: Sign-in browser opened. Waiting for callback at {args.redirect_uri}')
+        print(f'OAuth: Sign-in browser opened. Waiting for callback...')
         if not opened:
             print(f'OAuth: Could not open browser. Open this URL manually:\n{auth_url}')
 
@@ -1874,6 +1983,9 @@ def _oauth_helper_browser_flow(app, flow: dict, scope: list[str], result_path: P
             pass
 
     except Exception as exc:
+        import traceback
+        print(f'OAuth: Browser flow exception: {type(exc).__name__}: {exc}')
+        print(traceback.format_exc())
         _write_oauth_result(result_path, {'status': 'error', 'error': f'Browser OAuth flow failed: {exc}'})
 
 
@@ -1903,19 +2015,37 @@ def _handle_oauth_callback(callback_uri: str) -> None:
         pkce_files = list(temp_dir.glob('pkce_oauth_result_*.json'))
         log_msg(f'Found {len(pkce_files)} PKCE files')
 
-        if not pkce_files:
-            log_msg('No pending OAuth request found.')
-            return
-
-        pkce_file = pkce_files[-1]
-        log_msg(f'Using PKCE file: {pkce_file.name}')
-
-        try:
-            with pkce_file.open('r', encoding='utf-8') as fp:
-                pkce_data = json.load(fp)
-        except Exception as e:
-            log_msg(f'Failed to read PKCE data: {e}')
-            return
+        # Find PKCE file that matches the state parameter
+        callback_state = callback_params.get('state', '')
+        pkce_file = None
+        pkce_data = None
+        
+        for pf in reversed(pkce_files):  # Start from most recent
+            try:
+                with pf.open('r', encoding='utf-8') as fp:
+                    pd = json.load(fp)
+                    if pd.get('flow', {}).get('state') == callback_state:
+                        pkce_file = pf
+                        pkce_data = pd
+                        log_msg(f'Found matching PKCE file: {pf.name} with state: {callback_state}')
+                        break
+            except (json.JSONDecodeError, Exception):
+                pass
+        
+        if not pkce_file or not pkce_data:
+            # Fallback to most recent file if state matching fails
+            if pkce_files:
+                pkce_file = pkce_files[-1]
+                try:
+                    with pkce_file.open('r', encoding='utf-8') as fp:
+                        pkce_data = json.load(fp)
+                    log_msg(f'Using most recent PKCE file as fallback: {pkce_file.name}')
+                except (json.JSONDecodeError, Exception) as e:
+                    log_msg(f'Failed to read PKCE data: {e}')
+                    return
+            else:
+                log_msg('No pending OAuth request found.')
+                return
 
         result_file = Path(pkce_data['result_file'])
 
@@ -1946,8 +2076,22 @@ def _handle_oauth_callback(callback_uri: str) -> None:
 
             if 'access_token' in token_result:
                 email = ''
-                if 'account' in token_result and isinstance(token_result['account'], dict):
-                    email = token_result['account'].get('username', '')
+                
+                # Try to extract email from token claims
+                if 'id_token_claims' in token_result:
+                    email = token_result['id_token_claims'].get('email', '')
+                    log_msg(f'Email from id_token_claims: {email}')
+                
+                # Fallback: try account.username
+                if not email and 'account' in token_result:
+                    if isinstance(token_result['account'], dict):
+                        email = token_result['account'].get('username', '')
+                    log_msg(f'Email from account.username: {email}')
+                
+                # Fallback: use email from PKCE data (the email that was requested)
+                if not email:
+                    email = pkce_data.get('email', '')
+                    log_msg(f'Email from PKCE data: {email}')
 
                 log_msg(f'Token exchange successful! Email: {email}')
                 _write_oauth_result(result_file, {
@@ -1979,20 +2123,34 @@ def _handle_oauth_callback(callback_uri: str) -> None:
         log_msg(f'Callback handling failed: {type(exc).__name__}: {exc}')
         import traceback
         log_msg(traceback.format_exc())
+        # Try to write error to any available result file
+        try:
+            temp_dir = Path(tempfile.gettempdir())
+            result_files = list(temp_dir.glob('oauth_result_*.json'))
+            if result_files:
+                result_file = result_files[-1]
+                _write_oauth_result(result_file, {
+                    'status': 'error',
+                    'error': f'Callback handler failed: {exc}'
+                })
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
+    if '--oauth-callback' in sys.argv:
+        callback_idx = sys.argv.index('--oauth-callback')
+        if callback_idx + 1 < len(sys.argv):
+            callback_uri = sys.argv[callback_idx + 1]
+            _handle_oauth_callback(callback_uri)
+        sys.exit(0)
+    
     if sys.stdout is None:
         sys.stdout = open(os.devnull, 'w')
     if sys.stderr is None:
         sys.stderr = open(os.devnull, 'w')
 
-    if '--oauth-callback' in sys.argv:
-        callback_idx = sys.argv.index('--oauth-callback')
-        if callback_idx + 1 < sys.argv:
-            callback_uri = sys.argv[callback_idx + 1]
-            _handle_oauth_callback(callback_uri)
-    elif '--oauth-helper' in sys.argv:
+    if '--oauth-helper' in sys.argv:
         _run_oauth_helper_process()
     else:
         app = MailListFetcherGUI()

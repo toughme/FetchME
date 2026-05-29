@@ -20,6 +20,10 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Compile regex patterns once at module level for performance
+_EMAIL_HEADER_PATTERN = re.compile(rb'^From:\s*(.+?)$', re.MULTILINE | re.IGNORECASE)
+_DOMAIN_PATTERN = re.compile(r'"([^"]+)"')
+
 try:
     from exchangelib import Account, Configuration, Credentials, DELEGATE, Q, OAuth2AuthorizationCodeCredentials
     EXCHANGE_AVAILABLE = True
@@ -45,11 +49,13 @@ def setup_file_logging(output_dir: Path) -> Optional[logging.FileHandler]:
 
 
 def connect_with_retry(connect_fn, retries: int = 2, delay: float = 3.0, label: str = 'server'):
+    """Retry connection with exponential backoff. Catches only specific connection exceptions."""
     last_exc = None
     for attempt in range(1, retries + 2):
         try:
             return connect_fn()
         except (socket.timeout, ConnectionRefusedError, ConnectionResetError, TimeoutError, ssl.SSLError, OSError) as exc:
+            # Catch only specific connection-related exceptions, not SystemExit or KeyboardInterrupt
             last_exc = exc
             if attempt <= retries:
                 print(f'{label}: connection attempt {attempt} failed ({exc}), retrying in {delay}s...')
@@ -69,17 +75,22 @@ class FetchConfig:
 @dataclass
 class FetchSettings:
     thread_count: int = 1
-    save_content: bool = True
-    save_attachments: bool = True
+    # Defaults changed: only extract email addresses and save results by default.
+    save_content: bool = False
+    save_attachments: bool = False
     save_correct_account: bool = False
-    save_separated_file: bool = True
+    save_separated_file: bool = False
     save_email_result: bool = True
+    extract_subject: bool = False
+    extract_date: bool = False
+    extract_attachments_list: bool = False
+    extract_summary: bool = False
     keyword: str = ""
     date_from: Optional[datetime.date] = None
     date_to: Optional[datetime.date] = None
     search_subject: bool = True
     search_body: bool = True
-    save_log: bool = True
+    save_log: bool = False
     oauth_client_id: str = 'e9a7fea1-1cc0-4cd9-a31b-9137ca5deedd'
     oauth_authority: str = 'https://login.microsoftonline.com/common'
     oauth_redirect_uri: str = 'com.emclient.MailClient://oauth'
@@ -169,25 +180,52 @@ class IniLoader:
                     continue
             return None
 
+        # Validate and bound-check critical settings
+        try:
+            thread_count = int(section.get('ThreadCount', 1))
+            if thread_count < 1 or thread_count > 100:
+                thread_count = min(max(1, thread_count), 100)
+        except (ValueError, TypeError):
+            thread_count = 1
+
+        try:
+            connection_timeout = int(section.get('ConnectionTimeout', '30'))
+            if connection_timeout < 1 or connection_timeout > 300:
+                connection_timeout = min(max(1, connection_timeout), 300)
+        except (ValueError, TypeError):
+            connection_timeout = 30
+
+        try:
+            connection_retries = int(section.get('ConnectionRetries', '2'))
+            if connection_retries < 0 or connection_retries > 10:
+                connection_retries = min(max(0, connection_retries), 10)
+        except (ValueError, TypeError):
+            connection_retries = 2
+
         return FetchSettings(
-            thread_count=int(section.get('ThreadCount', 1)),
-            save_content=section.get('ChkSaveContent', '1') != '0',
-            save_attachments=section.get('ChkSaveAttachment', '1') != '0',
+            thread_count=thread_count,
+            # Default settings changed so that only email extraction (CSV) is enabled by default
+            save_content=section.get('ChkSaveContent', '0') != '0',
+            save_attachments=section.get('ChkSaveAttachment', '0') != '0',
             save_correct_account=section.get('ChkSaveCorrectAccount', '0') == '1',
-            save_separated_file=section.get('ChkToSeparatedFile', '1') == '1',
+            save_separated_file=section.get('ChkToSeparatedFile', '0') == '1',
             save_email_result=section.get('ChkSaveEmailResult', '1') != '0',
+            extract_subject=section.get('ChkExtractSubject', '0') == '1',
+            extract_date=section.get('ChkExtractDate', '0') == '1',
+            extract_attachments_list=section.get('ChkExtractAttachmentsList', '0') == '1',
+            extract_summary=section.get('ChkExtractSummary', '0') == '1',
             keyword=section.get('Keyword', '').strip(),
             date_from=_parse_date(section.get('DateFrom', '').strip()),
             date_to=_parse_date(section.get('DateTo', '').strip()),
             search_subject=section.get('ChkSearchFromSubject', '1') != '0',
             search_body=section.get('ChkSearchFromBody', '1') != '0',
-            save_log=section.get('ChkSaveLogFiles', '1') != '0',
+            save_log=section.get('ChkSaveLogFiles', '0') != '0',
             oauth_client_id=section.get('OauthClientId', 'e9a7fea1-1cc0-4cd9-a31b-9137ca5deedd'),
             oauth_authority=section.get('OauthAuthority', 'https://login.microsoftonline.com/common'),
             oauth_redirect_uri=section.get('OauthRedirectUri', 'com.emclient.MailClient://oauth'),
-        connection_timeout=int(section.get('ConnectionTimeout', '30')),
-        connection_retries=int(section.get('ConnectionRetries', '2')),
-    )
+            connection_timeout=connection_timeout,
+            connection_retries=connection_retries,
+        )
 
 
 class ServerResolver:
@@ -314,6 +352,18 @@ def decode_header_value(raw: str) -> str:
         else:
             value += part
     return value
+
+
+def extract_from_header_fast(raw_email: bytes) -> str:
+    """Fast extraction of From header without full message parsing. Used for performance optimization."""
+    try:
+        match = _EMAIL_HEADER_PATTERN.search(raw_email)
+        if match:
+            from_bytes = match.group(1)
+            return decode_header_value(from_bytes.decode('utf-8', errors='replace'))
+    except Exception:
+        pass
+    return ''
 
 
 def decode_message_text(msg: Message) -> Tuple[str, str, str, str]:
@@ -516,6 +566,7 @@ class BaseFetcher:
         self.abort_requested = False
         self._log_handler: Optional[logging.FileHandler] = None
         self.progress_callback = progress_callback
+        self.fetch_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 
     def _report_progress(self, status: str, current: int = 0, total: int = 0, folder: str = '') -> None:
         if self.progress_callback:
@@ -526,11 +577,24 @@ class BaseFetcher:
 
     def _setup_logging(self) -> None:
         if self.settings.save_log:
+            # Critical: Clear any existing file handlers to prevent accumulation on repeated fetches
+            root_logger = logging.getLogger()
+            for handler in list(root_logger.handlers):
+                if isinstance(handler, logging.FileHandler):
+                    root_logger.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
             self._log_handler = setup_file_logging(self.output_dir)
 
     def _teardown_logging(self) -> None:
         if self._log_handler:
             logging.getLogger().removeHandler(self._log_handler)
+            try:
+                self._log_handler.close()
+            except Exception:
+                pass
             self._log_handler.close()
             self._log_handler = None
 
@@ -548,13 +612,39 @@ class BaseFetcher:
         if not self.settings.save_email_result:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = self.output_dir / 'mail_list_results.csv'
-        with csv_path.open('w', newline='', encoding='utf-8-sig') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=['provider', 'folder', 'subject', 'from', 'date', 'has_attachments', 'attachments', 'summary', 'source_file'])
-            writer.writeheader()
-            for result in self.results:
-                writer.writerow(result)
-        print(f'Saved mail list result to {csv_path}')
+        
+        # Create unique filename with email and timestamp
+        safe_email = safe_filename(self.email_address, 'emails')
+        csv_filename = f'mail_list_{safe_email}_{self.fetch_timestamp}.csv'
+        csv_path = self.output_dir / csv_filename
+        
+        # Determine which fields to include based on settings
+        fieldnames = ['provider', 'from']
+        if self.settings.extract_subject:
+            fieldnames.append('subject')
+        if self.settings.extract_date:
+            fieldnames.append('date')
+        if self.settings.extract_attachments_list:
+            fieldnames.extend(['has_attachments', 'attachments'])
+        if self.settings.extract_summary:
+            fieldnames.append('summary')
+        
+        # Critical: Add error handling for CSV write operations
+        try:
+            with csv_path.open('w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+                for result in self.results:
+                    writer.writerow(result)
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+            print(f'Saved mail list result to {csv_path}')
+        except IOError as e:
+            print(f'Error: Failed to write CSV file {csv_path}: {e}')
+            logger.exception(f'CSV write error for {csv_path}')
+        except Exception as e:
+            print(f'Error: Unexpected error writing CSV {csv_path}: {e}')
+            logger.exception(f'Unexpected error writing CSV')
 
 
 class IMAPFetcher(BaseFetcher):
@@ -665,6 +755,207 @@ class IMAPFetcher(BaseFetcher):
             self._teardown_logging()
         return self.results
 
+    def _imap_fetch_command(self) -> str:
+        needs_body = bool(self.settings.keyword and self.settings.search_body)
+        needs_subject = bool(self.settings.extract_subject or (self.settings.keyword and self.settings.search_subject))
+        needs_full_parse = (
+            self.settings.save_attachments or self.settings.save_content or
+            self.settings.extract_attachments_list or self.settings.extract_summary or
+            needs_body
+        )
+        if needs_full_parse:
+            return '(BODY.PEEK[])'
+        if needs_subject:
+            return '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])'
+        return '(BODY.PEEK[HEADER.FIELDS (FROM)])'
+
+    def _fetch_imap_folder_sequential(self, mail: imaplib.IMAP4, folder: str, uids: list) -> None:
+        total = len(uids)
+        fetch_command = self._imap_fetch_command()
+        for idx, uid in enumerate(uids, 1):
+            self.check_abort()
+            if idx % 25 == 0 or idx == total:
+                self._report_progress(f'Fetching {folder}', idx, total, folder)
+                print(f'Progress: {idx}/{total} in folder {folder}')
+            try:
+                status, msg_data = mail.fetch(uid, fetch_command)
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
+                print(f'Error fetching message {uid} in folder {folder}: {exc}')
+                continue
+            if status != 'OK' or not msg_data or not msg_data[0]:
+                continue
+            raw_email = msg_data[0][1]
+            self._process_imap_message(raw_email, folder, idx)
+
+    def _fetch_imap_folder_parallel(self, folder: str, uids: list, thread_count: int, timeout: int) -> None:
+        """Fetch messages in parallel where each worker opens its own IMAP connection and
+        processes a contiguous chunk of UIDs. This avoids sharing imaplib connections across
+        threads which can cause hangs with large mailboxes.
+        """
+        def _open_imap():
+            if self.use_ssl:
+                ctx = ssl.create_default_context()
+                conn = imaplib.IMAP4_SSL(self.server, self.port or 993, ssl_context=ctx, timeout=timeout)
+            else:
+                conn = imaplib.IMAP4(self.server, self.port or 143, timeout=timeout)
+                try:
+                    ctx = ssl.create_default_context()
+                    conn.starttls(ctx)
+                except imaplib.IMAP4.error:
+                    pass
+            if self.oauth_access_token:
+                auth_string = f'user={self.email_address}\x01auth=Bearer {self.oauth_access_token}\x01\x01'
+                conn.authenticate('XOAUTH2', lambda _: auth_string.encode('utf-8'))
+            else:
+                conn.login(self.email_address, self.password)
+            # Select folder in the worker connection
+            conn.select(f'"{folder}"', readonly=True)
+            return conn
+
+        def _worker_chunk(chunk_uids: list, start_index: int):
+            try:
+                conn = _open_imap()
+            except Exception as exc:
+                print(f'Warning: worker could not open IMAP connection: {exc}')
+                return
+            try:
+                fetch_command = self._imap_fetch_command()
+                for offset, uid in enumerate(chunk_uids, start=0):
+                    self.check_abort()
+                    idx = start_index + offset
+                    if idx % 25 == 0 or idx == len(uids):
+                        self._report_progress(f'Fetching {folder}', idx, len(uids), folder)
+                    try:
+                        status, msg_data = conn.fetch(uid, fetch_command)
+                    except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
+                        print(f'Error fetching message {uid} in folder {folder}: {exc}')
+                        continue
+                    if status != 'OK' or not msg_data or not msg_data[0]:
+                        continue
+                    raw_email = msg_data[0][1]
+                    self._process_imap_message(raw_email, folder, idx)
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+
+        # Split UIDs into chunks for workers
+        total = len(uids)
+        if total == 0:
+            return
+        workers = min(thread_count, total)
+        chunk_size = (total + workers - 1) // workers
+        chunks = [uids[i * chunk_size:(i + 1) * chunk_size] for i in range(workers)]
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            start = 1
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                futures.append(pool.submit(_worker_chunk, chunk, start))
+                start += len(chunk)
+            # Wait for completion and raise errors if any
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        print(f'Warning: worker raised exception: {exc}')
+            except Exception as exc:
+                print(f'Warning: ThreadPoolExecutor encountered an error: {exc}')
+
+    def _process_imap_message(self, raw_email: bytes, folder: str, idx: int) -> None:
+        # Fast path: if only extracting email and no keyword filtering or subject-only filtering
+        needs_body = self.settings.keyword and self.settings.search_body
+        needs_subject = self.settings.extract_subject or (self.settings.keyword and self.settings.search_subject)
+        needs_full_parse = (self.settings.save_attachments or self.settings.save_content or 
+                           self.settings.extract_attachments_list or self.settings.extract_summary or 
+                           needs_body)
+        
+        if not needs_full_parse:
+            # Fast path: extract only From header without full message parsing
+            from_ = extract_from_header_fast(raw_email)
+            subject = ''
+            if needs_subject:
+                try:
+                    msg = email.message_from_bytes(raw_email)
+                    subject = decode_header_value(msg.get('Subject', ''))
+                except Exception:
+                    subject = ''
+            
+            if not message_matches_keyword(subject, '', self.settings):
+                return
+            
+            result = {'provider': 'IMAP', 'from': from_}
+            if self.settings.extract_subject:
+                result['subject'] = subject
+            if self.settings.extract_date:
+                result['date'] = ''
+            if self.settings.extract_attachments_list:
+                result['has_attachments'] = 'False'
+                result['attachments'] = ''
+            if self.settings.extract_summary:
+                result['summary'] = ''
+            self.results.append(result)
+            return
+        
+        # Full parse path: needed for attachments, content saving, or body filtering
+        try:
+            msg = email.message_from_bytes(raw_email)
+        except Exception as exc:
+            print(f'Warning: could not parse email at index {idx} from folder {folder}: {exc}')
+            return
+        
+        subject, from_, date, body = decode_message_text(msg)
+        if not message_matches_keyword(subject, body, self.settings):
+            return
+        
+        attachments: List[str] = []
+        if self.settings.save_attachments:
+            try:
+                for part in msg.walk():
+                    if part.get_content_maintype() == 'multipart':
+                        continue
+                    if part.get('Content-Disposition', '').strip().startswith('attachment'):
+                        try:
+                            attachment_dir = self.output_dir / 'attachments' / safe_filename(folder, 'folder')
+                            attachment_dir.mkdir(parents=True, exist_ok=True)
+                            attachments.extend(save_attachment(part, attachment_dir, idx, self.config))
+                        except Exception as exc:
+                            print(f'Warning: could not save attachment from email {idx} in folder {folder}: {exc}')
+            except Exception as exc:
+                print(f'Warning: error walking through email parts for {idx} in folder {folder}: {exc}')
+        
+        if self.settings.save_content:
+            try:
+                safe_subject = safe_filename(subject or 'message')
+                msg_dir = self.output_dir / 'messages' / safe_filename(folder, 'folder')
+                msg_dir.mkdir(parents=True, exist_ok=True)
+                msg_file = unique_path(msg_dir / f'{idx}_{safe_subject}.eml')
+                save_email_body(msg, msg_file)
+            except Exception as exc:
+                print(f'Warning: could not save message file for email {idx} in folder {folder}: {exc}')
+        
+        # Always extract email address; other fields are optional
+        result = {
+            'provider': 'IMAP',
+            'from': from_,
+        }
+        
+        if self.settings.extract_subject:
+            result['subject'] = subject
+        if self.settings.extract_date:
+            result['date'] = date
+        if self.settings.extract_attachments_list:
+            result['has_attachments'] = str(bool(attachments))
+            result['attachments'] = ';'.join(attachments)
+        if self.settings.extract_summary:
+            result['summary'] = body[:200].replace('\n', ' ').replace('\r', ' ')
+        
+        self.results.append(result)
+
 
 class POPFetcher(BaseFetcher):
     def fetch(self) -> List[Dict[str, str]]:
@@ -724,17 +1015,23 @@ class POPFetcher(BaseFetcher):
                     safe_subject = safe_filename(subject or 'message')
                     msg_file = unique_path(self.output_dir / 'messages' / 'POP3' / f'{msg_num}_{safe_subject}.eml')
                     save_email_body(msg, msg_file)
-                self.results.append({
+                
+                # Always extract email address; other fields are optional
+                result = {
                     'provider': 'POP3',
-                    'folder': 'POP3',
-                    'subject': subject,
                     'from': from_,
-                    'date': date,
-                    'has_attachments': str(bool(attachments)),
-                    'attachments': ';'.join(attachments),
-                    'summary': body[:200].replace('\n', ' ').replace('\r', ' '),
-                    'source_file': ''
-                })
+                }
+                if self.settings.extract_subject:
+                    result['subject'] = subject
+                if self.settings.extract_date:
+                    result['date'] = date
+                if self.settings.extract_attachments_list:
+                    result['has_attachments'] = str(bool(attachments))
+                    result['attachments'] = ';'.join(attachments)
+                if self.settings.extract_summary:
+                    result['summary'] = body[:200].replace('\n', ' ').replace('\r', ' ')
+                
+                self.results.append(result)
         except poplib.error_proto as exc:
             error_msg = str(exc)
             if 'auth' in error_msg.lower() or 'pass' in error_msg.lower() or 'login' in error_msg.lower():
@@ -858,125 +1155,29 @@ class ExchangeFetcher(BaseFetcher):
                         msg_file.parent.mkdir(parents=True, exist_ok=True)
                         with msg_file.open('w', encoding='utf-8', errors='replace') as fp:
                             fp.write(f'Subject: {subject}\nFrom: {from_}\nDate: {date}\n\n{body}')
-                    self.results.append({
+                    
+                    # Always extract email address; other fields are optional
+                    result = {
                         'provider': 'Exchange',
-                        'folder': folder_name,
-                        'subject': subject,
                         'from': from_,
-                        'date': date,
-                        'has_attachments': str(bool(attachments)),
-                        'attachments': ';'.join(attachments),
-                        'summary': body[:200].replace('\n', ' ').replace('\r', ' '),
-                        'source_file': ''
-                    })
+                    }
+                    if self.settings.extract_subject:
+                        result['subject'] = subject
+                    if self.settings.extract_date:
+                        result['date'] = date
+                    if self.settings.extract_attachments_list:
+                        result['has_attachments'] = str(bool(attachments))
+                        result['attachments'] = ';'.join(attachments)
+                    if self.settings.extract_summary:
+                        result['summary'] = body[:200].replace('\n', ' ').replace('\r', ' ')
+                    
+                    self.results.append(result)
                 if len(page) < page_size:
                     break
                 offset += page_size
         self.save_results()
         self._teardown_logging()
         return self.results
-
-    def _fetch_imap_folder_sequential(self, mail: imaplib.IMAP4, folder: str, uids: list) -> None:
-        total = len(uids)
-        for idx, uid in enumerate(uids, 1):
-            self.check_abort()
-            if idx % 25 == 0 or idx == total:
-                self._report_progress(f'Fetching {folder}', idx, total, folder)
-                print(f'Progress: {idx}/{total} in folder {folder}')
-            try:
-                status, msg_data = mail.fetch(uid, '(BODY.PEEK[])')
-            except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
-                print(f'Error fetching message {uid} in folder {folder}: {exc}')
-                continue
-            if status != 'OK' or not msg_data or not msg_data[0]:
-                continue
-            raw_email = msg_data[0][1]
-            self._process_imap_message(raw_email, folder, idx)
-
-    def _fetch_imap_folder_parallel(self, folder: str, uids: list, thread_count: int, timeout: int) -> None:
-        def _open_imap():
-            if self.use_ssl:
-                ctx = ssl.create_default_context()
-                conn = imaplib.IMAP4_SSL(self.server, self.port or 993, ssl_context=ctx, timeout=timeout)
-            else:
-                conn = imaplib.IMAP4(self.server, self.port or 143, timeout=timeout)
-                try:
-                    ctx = ssl.create_default_context()
-                    conn.starttls(ctx)
-                except imaplib.IMAP4.error:
-                    pass
-            if self.oauth_access_token:
-                auth_string = f'user={self.email_address}\x01auth=Bearer {self.oauth_access_token}\x01\x01'
-                conn.authenticate('XOAUTH2', lambda _: auth_string.encode('utf-8'))
-            else:
-                conn.login(self.email_address, self.password)
-            conn.select(f'"{folder}"', readonly=True)
-            return conn
-
-        def _fetch_uid(args):
-            conn, uid, idx = args
-            self.check_abort()
-            try:
-                status, msg_data = conn.fetch(uid, '(BODY.PEEK[])')
-            except (imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
-                print(f'Error fetching message {uid} in folder {folder}: {exc}')
-                return None
-            if status != 'OK' or not msg_data or not msg_data[0]:
-                return None
-            return msg_data[0][1], idx
-
-        connections: list = []
-        try:
-            for _ in range(min(thread_count, len(uids))):
-                try:
-                    connections.append(_open_imap())
-                except Exception as exc:
-                    print(f'Warning: could not open parallel IMAP connection: {exc}')
-                    break
-            if not connections:
-                print('Parallel IMAP failed: no connections. Falling back to sequential.')
-                return
-            work_items = [(connections[i % len(connections)], uid, idx + 1) for idx, uid in enumerate(uids)]
-            with ThreadPoolExecutor(max_workers=len(connections)) as pool:
-                for result in pool.map(_fetch_uid, work_items):
-                    if result is None:
-                        continue
-                    raw_email, idx = result
-                    self._process_imap_message(raw_email, folder, idx)
-        finally:
-            for conn in connections:
-                try:
-                    conn.logout()
-                except Exception:
-                    pass
-
-    def _process_imap_message(self, raw_email: bytes, folder: str, idx: int) -> None:
-        msg = email.message_from_bytes(raw_email)
-        subject, from_, date, body = decode_message_text(msg)
-        if not message_matches_keyword(subject, body, self.settings):
-            return
-        attachments: List[str] = []
-        if self.settings.save_attachments:
-            for part in msg.walk():
-                if part.get_content_maintype() == 'multipart':
-                    continue
-                if part.get('Content-Disposition', '').strip().startswith('attachment'):
-                    attachments.extend(save_attachment(part, self.output_dir / 'attachments' / safe_filename(folder, 'folder'), idx, self.config))
-        if self.settings.save_content:
-            safe_subject = safe_filename(subject or 'message')
-            msg_file = unique_path(self.output_dir / 'messages' / safe_filename(folder, 'folder') / f'{idx}_{safe_subject}.eml')
-            save_email_body(msg, msg_file)
-        self.results.append({
-            'provider': 'IMAP',
-            'folder': folder,
-            'subject': subject,
-            'from': from_,
-            'date': date,
-            'has_attachments': str(bool(attachments)),
-            'attachments': ';'.join(attachments),
-            'summary': body[:200].replace('\n', ' ').replace('\r', ' '),
-            'source_file': ''
-        })
 
 
 def parse_args() -> argparse.Namespace:
