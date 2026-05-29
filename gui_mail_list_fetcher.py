@@ -227,6 +227,7 @@ class MailListFetcherGUI(tk.Tk):
         self.separated_file_var = tk.BooleanVar(value=False)
         self.correct_account_var = tk.BooleanVar(value=False)
         self.thread_count_var = tk.StringVar(value='5')
+        self.batch_size_var = tk.StringVar(value='50')
         
         self.extract_subject_var = tk.BooleanVar(value=False)
         self.extract_date_var = tk.BooleanVar(value=False)
@@ -520,6 +521,8 @@ class MailListFetcherGUI(tk.Tk):
 
         ttk.Label(options_frame, text='Thread Count:').grid(row=3, column=0, sticky='w', padx=8, pady=4)
         ttk.Entry(options_frame, textvariable=self.thread_count_var, width=8).grid(row=3, column=1, sticky='w', padx=8, pady=4)
+        ttk.Label(options_frame, text='Batch Size:').grid(row=3, column=2, sticky='w', padx=8, pady=4)
+        ttk.Entry(options_frame, textvariable=self.batch_size_var, width=8).grid(row=3, column=3, sticky='w', padx=8, pady=4)
 
         timeout_frame = ttk.Frame(options_frame)
         timeout_frame.grid(row=4, column=0, columnspan=2, sticky='w', padx=8, pady=4)
@@ -623,6 +626,7 @@ class MailListFetcherGUI(tk.Tk):
             self.oauth_client_id = settings.oauth_client_id
             self.oauth_authority = settings.oauth_authority
             self.timeout_var.set(str(settings.connection_timeout))
+            self.batch_size_var.set(str(settings.batch_size))
 
             def fill_text(widget: tk.Text, values: list[str]) -> None:
                 if widget is None:
@@ -664,10 +668,11 @@ class MailListFetcherGUI(tk.Tk):
         settings.extract_date = self.extract_date_var.get()
         settings.extract_attachments_list = self.extract_attachments_list_var.get()
         settings.extract_summary = self.extract_summary_var.get()
-        settings.thread_count = int(self.thread_count_var.get() or '1')
+        settings.thread_count = int(self.thread_count_var.get() or '5')
         settings.oauth_client_id = self.oauth_client_id
         settings.oauth_authority = self.oauth_authority
         settings.connection_timeout = int(self.timeout_var.get() or '30')
+        settings.batch_size = int(self.batch_size_var.get() or '50')
 
         parser = core.configparser.ConfigParser()
         parser['MailListFetcher'] = {
@@ -691,6 +696,7 @@ class MailListFetcherGUI(tk.Tk):
             'OauthAuthority': settings.oauth_authority,
             'OauthRedirectUri': settings.oauth_redirect_uri,
             'ConnectionTimeout': str(settings.connection_timeout),
+            'BatchSize': str(settings.batch_size),
         }
         with self.settings_path.open('w', encoding='utf-8', newline='') as fp:
             parser.write(fp)
@@ -1660,7 +1666,7 @@ class MailListFetcherGUI(tk.Tk):
 
     def _build_fetch_settings(self) -> core.FetchSettings:
         settings = core.FetchSettings(
-            thread_count=int(self.thread_count_var.get() or '1'),
+            thread_count=int(self.thread_count_var.get() or '5'),
             save_content=self.save_content_var.get(),
             save_attachments=self.save_attachments_var.get(),
             save_correct_account=self.correct_account_var.get(),
@@ -1677,6 +1683,7 @@ class MailListFetcherGUI(tk.Tk):
             search_body=self.search_body_var.get(),
             save_log=self.save_logs_var.get(),
             connection_timeout=int(self.timeout_var.get() or '30'),
+            batch_size=int(self.batch_size_var.get() or '50'),
         )
         return settings
 
