@@ -101,6 +101,7 @@ class FetchSettings:
     connection_timeout: int = 30
     connection_retries: int = 2
     batch_size: int = IMAP_BATCH_SIZE
+    attachment_extensions: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -236,6 +237,7 @@ class IniLoader:
             connection_timeout=connection_timeout,
             connection_retries=connection_retries,
             batch_size=batch_size,
+            attachment_extensions=[],
         )
 
 
