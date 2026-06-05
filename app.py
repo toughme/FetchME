@@ -200,49 +200,43 @@ class LoginTestWorker(QThread):
                 self.finished.emit()
                 return
             
-            # Check if a saved OAuth token exists for this email
+            # First, check if a saved IMAP OAuth token exists for this email
             oauth_token = self._try_load_oauth_token('IMAP', email)
             if oauth_token:
-                self.row_update.emit(email, 'IMAP', 'oauth', 'Login succeeded (OAuth)', 'outlook.office365.com')
+                self.row_update.emit(email, 'IMAP', 'outlook.office365.com', 'Login succeeded (OAuth)', '')
                 continue
             
+            # If no OAuth token, proceed with normal password-based login
             if not password:
-                self.row_update.emit(email, '', '', 'Missing password - use OAuth', '')
+                self.row_update.emit(email, '', '', 'No password or OAuth token', '')
                 continue
 
+            # Try IMAP login first
             server_hint = domain.strip() or email.split('@')[-1]
-            protocol = 'IMAP'
-            status = 'Testing IMAP...'
-            progress = ''
-            self.row_update.emit(email, protocol, '', status, '')
+            self.row_update.emit(email, 'IMAP', '', 'Testing IMAP...', '')
 
             imap_success, imap_server, imap_port, imap_reason = self._attempt_login(email, password, server_hint, 'IMAP')
             if self._abort_requested:
                 self.finished.emit()
                 return
             if imap_success:
-                status = 'Login succeeded (IMAP)'
-                progress = f'{imap_server}:{imap_port}' if imap_server else ''
-                self.row_update.emit(email, 'IMAP', imap_server or '', status, progress)
+                self.row_update.emit(email, 'IMAP', imap_server or '', 'Login succeeded (IMAP)', f'{imap_server}:{imap_port}' if imap_server else '')
                 continue
 
-            protocol = 'POP3'
-            status = 'Testing POP3...'
-            self.row_update.emit(email, protocol, '', status, '')
+            # If IMAP failed, try POP3
+            self.row_update.emit(email, 'POP3', '', 'Testing POP3...', '')
 
             pop_success, pop_server, pop_port, pop_reason = self._attempt_login(email, password, server_hint, 'POP3')
             if self._abort_requested:
                 self.finished.emit()
                 return
             if pop_success:
-                status = 'Login succeeded (POP3)'
-                progress = f'{pop_server}:{pop_port}' if pop_server else ''
-                self.row_update.emit(email, 'POP3', pop_server or '', status, progress)
+                self.row_update.emit(email, 'POP3', pop_server or '', 'Login succeeded (POP3)', f'{pop_server}:{pop_port}' if pop_server else '')
                 continue
 
-            status = 'Login failed'
+            # Both failed
             reason = pop_reason or imap_reason or 'Unknown error'
-            self.row_update.emit(email, 'Failed', '', f'{status}: {reason}', '')
+            self.row_update.emit(email, 'Failed', '', f'Login failed: {reason}', '')
 
         self.finished.emit()
     
