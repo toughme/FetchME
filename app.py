@@ -182,12 +182,13 @@ class LoginTestWorker(QThread):
     row_update = Signal(str, str, str, str, str)
     finished = Signal()
 
-    def __init__(self, login_entries: list[tuple[str, str, str]], config: core.FetchConfig, rules: list[core.ServerRule], settings: core.FetchSettings):
+    def __init__(self, login_entries: list[tuple[str, str, str]], config: core.FetchConfig, rules: list[core.ServerRule], settings: core.FetchSettings, root_dir: Path = None):
         super().__init__()
         self.login_entries = login_entries
         self.config = config
         self.rules = rules
         self.settings = settings
+        self.root_dir = root_dir or Path(__file__).resolve().parent.parent
         self._abort_requested = False
 
     def request_abort(self) -> None:
@@ -262,7 +263,7 @@ class LoginTestWorker(QThread):
             return None
     
     def _get_secure_token_dir(self) -> Path:
-        token_dir = Path.home() / '.oauth_tokens'
+        token_dir = self.root_dir / '.oauth_tokens'
         token_dir.mkdir(parents=True, exist_ok=True)
         return token_dir
     
@@ -531,7 +532,7 @@ class MailFetcherWindow(QMainWindow):
         domain = email.split('@')[-1] if '@' in email else ''
         config = core.IniLoader.load_config(self.config_path)
         rules = core.IniLoader.load_server_rules(self.server_path)
-        self.login_test_worker = LoginTestWorker([(email, password, domain)], config, rules, self.default_settings)
+        self.login_test_worker = LoginTestWorker([(email, password, domain)], config, rules, self.default_settings, self.root_dir)
         self.login_test_worker.row_update.connect(self._on_login_test_row_update)
         self.login_test_worker.finished.connect(self._on_manual_login_finished)
         self.login_test_worker.start()
@@ -639,7 +640,7 @@ class MailFetcherWindow(QMainWindow):
 
         config = core.IniLoader.load_config(self.config_path)
         rules = core.IniLoader.load_server_rules(self.server_path)
-        self.login_test_worker = LoginTestWorker(self.login_entries, config, rules, self.default_settings)
+        self.login_test_worker = LoginTestWorker(self.login_entries, config, rules, self.default_settings, self.root_dir)
         self.login_test_worker.row_update.connect(self._on_login_test_row_update)
         self.login_test_worker.finished.connect(self._on_login_test_finished)
         self.login_test_worker.start()
